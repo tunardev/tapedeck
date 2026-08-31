@@ -46,11 +46,39 @@ pub fn isHopHeader(name: []const u8) bool {
         "transfer-encoding",
         "connection",
         "host",
+        // the client writes both of these itself; forwarding the caller's copy
+        // sends them twice, and a duplicate accept-encoding advertising br or
+        // zstd makes the response undecodable
+        "accept-encoding",
+        "user-agent",
         // changes on every recording, so keeping it makes re-record diffs
         // pure noise without telling a reader anything
         "date",
     };
     for (hop) |h| {
+        if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
+
+/// Headers that must be dropped when a redirect crosses to another domain.
+///
+/// `std.http.Client` strips `privileged_headers` on a cross-domain redirect and
+/// deliberately preserves `extra_headers`. Sending credentials in the latter
+/// re-delivers the caller's API key to whatever host a 302 names.
+fn isCredential(name: []const u8) bool {
+    const names = [_][]const u8{
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "x-amz-security-token",
+        "cookie",
+        "openai-organization",
+        "openai-project",
+    };
+    for (names) |h| {
         if (std.ascii.eqlIgnoreCase(name, h)) return true;
     }
     return false;
@@ -75,11 +103,17 @@ pub fn forward(
 
     var extra: std.ArrayList(http.Header) = .empty;
     defer extra.deinit(gpa);
+    var privileged: std.ArrayList(http.Header) = .empty;
+    defer privileged.deinit(gpa);
     for (req.headers) |h| {
         // The client's Host and framing headers describe the hop to us, not to
         // the provider; the client sets both correctly for the real destination.
         if (isHopHeader(h.name)) continue;
-        try extra.append(gpa, .{ .name = h.name, .value = h.value });
+        if (isCredential(h.name)) {
+            try privileged.append(gpa, .{ .name = h.name, .value = h.value });
+        } else {
+            try extra.append(gpa, .{ .name = h.name, .value = h.value });
+        }
     }
 
     var client: http.Client = .{ .allocator = gpa, .io = io };
@@ -87,13 +121,21 @@ pub fn forward(
 
     var r = try client.request(req.method, uri, .{
         .extra_headers = extra.items,
+        .privileged_headers = privileged.items,
+        // A recording proxy records the 3xx and lets the real client decide.
+        // Following it here would also hand the credentials to the new host.
+        .redirect_behavior = .not_allowed,
         .keep_alive = false,
     });
     defer r.deinit();
 
-    const body_copy = try gpa.dupe(u8, req.body);
-    defer gpa.free(body_copy);
-    try r.sendBodyComplete(body_copy);
+    if (req.method.requestHasBody()) {
+        const body_copy = try gpa.dupe(u8, req.body);
+        defer gpa.free(body_copy);
+        try r.sendBodyComplete(body_copy);
+    } else {
+        try r.sendBodiless();
+    }
 
     var redirect_buffer: [8192]u8 = undefined;
     var response = try r.receiveHead(&redirect_buffer);
@@ -128,16 +170,22 @@ pub fn forward(
     errdefer body.deinit(gpa);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = body_reader.readSliceShort(&chunk) catch break;
+        // readSliceShort reports end-of-stream as a short read, so an error
+        // here is always a real failure. Recording it as a complete body would
+        // commit a truncated fixture that replays green forever.
+        const n = body_reader.readSliceShort(&chunk) catch return error.UpstreamBodyTruncated;
         if (n == 0) break;
         try body.appendSlice(gpa, chunk[0..n]);
+    }
+    if (response.head.content_length) |declared| {
+        if (body.items.len != declared) return error.UpstreamBodyTruncated;
     }
 
     return .{
         .status = @intFromEnum(response.head.status),
         .headers = try out_headers.toOwnedSlice(gpa),
         .body = try body.toOwnedSlice(gpa),
-        .chunked = response.head.content_length == null,
+        .chunked = response.head.transfer_encoding == .chunked,
     };
 }
 

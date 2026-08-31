@@ -31,7 +31,6 @@ full agent test suite.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tunardev/tapedeck/main/packaging/install.sh | sh
 ```
-
 A single static binary, no runtime. Built in Zig with **zero dependencies** —
 everything it needs is in the standard library.
 

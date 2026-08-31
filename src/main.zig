@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "key")) {
             i += 1;
             if (i >= argv.items.len) return fail(io, "key needs a request body");
-            const k = try matching.key(gpa, argv.items[i], &matching.all_scrubbers, &.{});
+            const k = try matching.key(gpa, .{}, argv.items[i], .{});
             defer gpa.free(k);
             return printLine(io, k);
         } else if (std.mem.eql(u8, a, "ls")) {

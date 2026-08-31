@@ -1,72 +1,186 @@
 //! Match keys for cassette lookup.
 //!
-//! Two runs of the same test rarely produce byte-identical request bodies, so a
-//! byte comparison re-records constantly. Two *different* calls must never
-//! collide, because a wrong replay is a green test that proves nothing. This
-//! module turns a request body into a key that tolerates the first without
-//! permitting the second.
+//! Two runs of the same call must produce one key; two different calls must
+//! never produce the same key. The second matters more — a missed match costs
+//! an API call, a wrong match is a green test that proves nothing. Where the
+//! two conflict, this module misses.
+//!
+//! The encoding is length-prefixed rather than delimited, so no byte inside a
+//! value can be read as structure. A delimited form let `{"x":1,"y":2}` and
+//! `{"x:1,y":2}` render identically.
 
 const std = @import("std");
 
-/// Volatile spans replaced before the key is formed.
+/// Volatile spans replaced inside string values.
 ///
-/// Agents inject all three of these into prompts as a matter of course: the
-/// current date, a session or tool-call id, and absolute paths that differ
-/// between a laptop and a CI runner. Canonical JSON alone does not survive them.
-pub const Scrubber = enum {
-    timestamp,
-    uuid,
-    abs_path,
+/// Applied per value during encoding, never to the assembled output: scrubbing
+/// joined text let a path swallow the separator between a key and its value.
+pub const Scrubber = enum { timestamp, uuid, home_dir };
 
-    fn placeholder(s: Scrubber) []const u8 {
-        return switch (s) {
-            .timestamp => "<TIMESTAMP>",
-            .uuid => "<UUID>",
-            .abs_path => "<PATH>",
-        };
-    }
+pub const all_scrubbers = [_]Scrubber{ .timestamp, .uuid, .home_dir };
 
-    fn matchLen(s: Scrubber, text: []const u8) ?usize {
-        return switch (s) {
-            .timestamp => matchIso8601(text),
-            .uuid => matchUuid(text),
-            .abs_path => matchAbsPath(text),
-        };
-    }
+/// What the request was, beyond its body.
+///
+/// The body alone is not an identity: two `POST .../batches/{id}/cancel` calls
+/// carry equal empty bodies and must not replay each other.
+pub const Target = struct {
+    method: []const u8 = "POST",
+    provider: []const u8 = "",
+    /// Path including any query string, as received.
+    path: []const u8 = "",
 };
 
-/// The default scrub set.
-pub const all_scrubbers = [_]Scrubber{ .timestamp, .uuid, .abs_path };
+pub const Options = struct {
+    scrubbers: []const Scrubber = &all_scrubbers,
+    /// Dotted JSON paths dropped before the key is formed.
+    ignore: []const []const u8 = &.{},
+};
 
-/// The key a cassette entry is stored and looked up under. Caller owns the result.
-///
-/// A body that is not JSON falls back to its own bytes, so it still matches
-/// itself exactly rather than silently colliding with everything else.
+/// The key a cassette entry is stored and looked up under. Caller owns it.
 pub fn key(
     gpa: std.mem.Allocator,
+    target: Target,
     body: []const u8,
-    scrubbers: []const Scrubber,
-    /// Dotted JSON paths dropped before the key is formed, e.g.
-    /// `metadata.request_id`. Field-level and exact, unlike a pattern, which
-    /// can silently over-match and collapse two different calls into one.
-    ignore: []const []const u8,
+    options: Options,
 ) ![]u8 {
-    const canonical = canonicalize(gpa, body, ignore) catch try gpa.dupe(u8, body);
-    defer gpa.free(canonical);
-    return scrub(gpa, canonical, scrubbers);
-}
-
-fn canonicalize(gpa: std.mem.Allocator, body: []const u8, ignore: []const []const u8) ![]u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
-    defer parsed.deinit();
-
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try writeCanonical(gpa, parsed.value, &out, "", ignore);
+
+    try writeScalar(gpa, &out, 'm', target.method, &.{});
+    try writeScalar(gpa, &out, 'p', target.provider, &.{});
+    try writePath(gpa, &out, target.path);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |e| switch (e) {
+        // Out of memory must not silently produce a different key for the same
+        // body; only a genuine parse failure falls back.
+        error.OutOfMemory => return e,
+        else => {
+            // Hex, so a binary request body cannot put non-UTF-8 bytes into a
+            // key that is later written to a JSON cassette line.
+            const hex = try gpa.alloc(u8, body.len * 2);
+            defer gpa.free(hex);
+            _ = std.fmt.bufPrint(hex, "{x}", .{body}) catch unreachable;
+            try writeScalar(gpa, &out, 'r', hex, &.{});
+            return out.toOwnedSlice(gpa);
+        },
+    };
+    defer parsed.deinit();
+
+    try out.append(gpa, 'j');
+    try writeValue(gpa, &out, parsed.value, "", options);
     return out.toOwnedSlice(gpa);
 }
 
-/// Whether `prefix` + `name` names an ignored path.
+/// Query values are dropped and only their names kept: Gemini authenticates
+/// with `?key=`, so a verbatim path would write a credential to disk.
+fn writePath(gpa: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8) !void {
+    const split = std.mem.indexOfScalar(u8, path, '?');
+    try writeScalar(gpa, out, 'u', if (split) |i| path[0..i] else path, &.{});
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    var it = std.mem.splitScalar(u8, if (split) |i| path[i + 1 ..] else "", '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        try names.append(gpa, pair[0..eq]);
+    }
+    std.mem.sortUnstable([]const u8, names.items, {}, lessThan);
+
+    try writeCount(gpa, out, 'q', names.items.len);
+    for (names.items) |name| try writeScalar(gpa, out, 'k', name, &.{});
+}
+
+fn writeValue(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    v: std.json.Value,
+    prefix: []const u8,
+    options: Options,
+) error{OutOfMemory}!void {
+    switch (v) {
+        .null => try out.append(gpa, 'z'),
+        .bool => |b| try out.append(gpa, if (b) 't' else 'f'),
+        .integer => |n| {
+            var buf: [24]u8 = undefined;
+            try writeScalar(gpa, out, 'n', std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable, &.{});
+        },
+        .float => |f| {
+            // std.fmt.float.bufferSize(.decimal, f64) is 347; a 40-byte buffer
+            // made 1e40 fail to encode and silently change the key.
+            var buf: [347]u8 = undefined;
+            const text = if (f == @trunc(f) and @abs(f) < 9007199254740992.0) blk: {
+                const as_int: i64 = @intFromFloat(f);
+                break :blk std.fmt.bufPrint(&buf, "{d}", .{as_int}) catch unreachable;
+            } else std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
+            try writeScalar(gpa, out, 'n', text, &.{});
+        },
+        .number_string => |s| try writeScalar(gpa, out, 'n', s, &.{}),
+        .string => |s| try writeScalar(gpa, out, 's', s, options.scrubbers),
+        .array => |items| {
+            try writeCount(gpa, out, 'a', items.items.len);
+            for (items.items) |item| try writeValue(gpa, out, item, prefix, options);
+        },
+        .object => |obj| {
+            const names = try gpa.alloc([]const u8, obj.count());
+            defer gpa.free(names);
+            var kept: usize = 0;
+            for (obj.keys()) |name| {
+                if (isIgnored(prefix, name, options.ignore)) continue;
+                names[kept] = name;
+                kept += 1;
+            }
+            // std.json preserves document order, so this sort is what makes the
+            // key stable rather than something the parser happens to supply.
+            std.mem.sortUnstable([]const u8, names[0..kept], {}, lessThan);
+
+            try writeCount(gpa, out, 'o', kept);
+            for (names[0..kept]) |name| {
+                // Keys are never scrubbed: two paths used as keys would reduce
+                // to one name and collide inside a single object.
+                try writeScalar(gpa, out, 'k', name, &.{});
+                const child = if (prefix.len == 0)
+                    try gpa.dupe(u8, name)
+                else
+                    try std.fmt.allocPrint(gpa, "{s}.{s}", .{ prefix, name });
+                defer gpa.free(child);
+                try writeValue(gpa, out, obj.get(name).?, child, options);
+            }
+        },
+    }
+}
+
+fn writeCount(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, n: usize) !void {
+    var buf: [24]u8 = undefined;
+    try out.append(gpa, tag);
+    try out.appendSlice(gpa, std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable);
+    try out.append(gpa, ':');
+}
+
+/// `<tag><byte length>:<bytes>`. The length is what makes the encoding
+/// unambiguous — the bytes that follow are never scanned for structure.
+fn writeScalar(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    tag: u8,
+    text: []const u8,
+    scrubbers: []const Scrubber,
+) !void {
+    var scrubbed: std.ArrayList(u8) = .empty;
+    defer scrubbed.deinit(gpa);
+    try scrub(gpa, &scrubbed, text, scrubbers);
+
+    var buf: [24]u8 = undefined;
+    try out.append(gpa, tag);
+    try out.appendSlice(gpa, std.fmt.bufPrint(&buf, "{d}", .{scrubbed.items.len}) catch unreachable);
+    try out.append(gpa, ':');
+    try out.appendSlice(gpa, scrubbed.items);
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
 fn isIgnored(prefix: []const u8, name: []const u8, ignore: []const []const u8) bool {
     for (ignore) |path| {
         if (prefix.len == 0) {
@@ -81,98 +195,49 @@ fn isIgnored(prefix: []const u8, name: []const u8, ignore: []const []const u8) b
     return false;
 }
 
-/// Order-independent rendering of a JSON value.
-///
-/// `std.json` preserves document order, so sorting here is what makes the key
-/// stable rather than a no-op the parser happens to supply.
-fn writeCanonical(
-    gpa: std.mem.Allocator,
-    v: std.json.Value,
-    out: *std.ArrayList(u8),
-    prefix: []const u8,
-    ignore: []const []const u8,
-) !void {
-    switch (v) {
-        .object => |obj| {
-            const keys = try gpa.alloc([]const u8, obj.count());
-            defer gpa.free(keys);
-            for (obj.keys(), 0..) |k, i| keys[i] = k;
-            std.mem.sortUnstable([]const u8, keys, {}, lessThanSlice);
-
-            try out.append(gpa, '{');
-            for (keys) |k| {
-                if (isIgnored(prefix, k, ignore)) continue;
-                const child = if (prefix.len == 0)
-                    try gpa.dupe(u8, k)
-                else
-                    try std.fmt.allocPrint(gpa, "{s}.{s}", .{ prefix, k });
-                defer gpa.free(child);
-                try out.appendSlice(gpa, k);
-                try out.append(gpa, ':');
-                try writeCanonical(gpa, obj.get(k).?, out, child, ignore);
-                try out.append(gpa, ',');
-            }
-            try out.append(gpa, '}');
-        },
-        .array => |items| {
-            try out.append(gpa, '[');
-            for (items.items) |item| {
-                try writeCanonical(gpa, item, out, prefix, ignore);
-                try out.append(gpa, ',');
-            }
-            try out.append(gpa, ']');
-        },
-        // `0` and `0.0` are the same temperature; SDKs across languages
-        // disagree on which one they serialize. Whole floats are written as
-        // integers rather than the reverse, which would lose precision above 2^53.
-        .integer => |n| {
-            var buf: [24]u8 = undefined;
-            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "{d}", .{n}));
-        },
-        .float => |f| {
-            var buf: [40]u8 = undefined;
-            if (f == @trunc(f) and @abs(f) < 9007199254740992.0) {
-                const as_int: i64 = @intFromFloat(f);
-                try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "{d}", .{as_int}));
-            } else {
-                try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "{d}", .{f}));
-            }
-        },
-        .number_string => |s| try out.appendSlice(gpa, s),
-        .string => |s| {
-            try out.append(gpa, '"');
-            try out.appendSlice(gpa, s);
-            try out.append(gpa, '"');
-        },
-        .bool => |b| try out.appendSlice(gpa, if (b) "true" else "false"),
-        .null => try out.appendSlice(gpa, "null"),
-    }
-}
-
-fn lessThanSlice(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.order(u8, a, b) == .lt;
-}
-
 /// Every pattern is ASCII, so byte-wise scanning copies multi-byte UTF-8
-/// sequences through untouched.
-fn scrub(gpa: std.mem.Allocator, text: []const u8, scrubbers: []const Scrubber) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.ensureTotalCapacity(gpa, text.len);
-
+/// through untouched. A literal `<` is doubled so ordinary text cannot
+/// impersonate a placeholder and collide with a scrubbed value.
+fn scrub(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    scrubbers: []const Scrubber,
+) !void {
+    if (scrubbers.len == 0) {
+        try out.appendSlice(gpa, text);
+        return;
+    }
     var i: usize = 0;
     outer: while (i < text.len) {
+        const prev: ?u8 = if (i == 0) null else text[i - 1];
         for (scrubbers) |s| {
-            if (s.matchLen(text[i..])) |n| {
-                try out.appendSlice(gpa, s.placeholder());
+            if (matchLen(s, text[i..], prev)) |n| {
+                try out.appendSlice(gpa, placeholder(s));
                 i += n;
                 continue :outer;
             }
         }
+        if (text[i] == '<') try out.append(gpa, '<');
         try out.append(gpa, text[i]);
         i += 1;
     }
-    return out.toOwnedSlice(gpa);
+}
+
+fn placeholder(s: Scrubber) []const u8 {
+    return switch (s) {
+        .timestamp => "<TIME>",
+        .uuid => "<UUID>",
+        .home_dir => "<HOME>",
+    };
+}
+
+fn matchLen(s: Scrubber, text: []const u8, prev: ?u8) ?usize {
+    return switch (s) {
+        .timestamp => matchTimestamp(text, prev),
+        .uuid => matchUuid(text, prev),
+        .home_dir => matchHomeDir(text),
+    };
 }
 
 fn isDigit(c: u8) bool {
@@ -183,62 +248,90 @@ fn isHex(c: u8) bool {
     return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
 }
 
-/// `2026-08-31T14:22:03Z`, `2026-08-31 14:22:03.123`, or a bare `2026-08-31`.
-fn matchIso8601(t: []const u8) ?usize {
-    if (t.len < 10) return null;
-    const date = isDigit(t[0]) and isDigit(t[1]) and isDigit(t[2]) and isDigit(t[3]) and
-        t[4] == '-' and isDigit(t[5]) and isDigit(t[6]) and
-        t[7] == '-' and isDigit(t[8]) and isDigit(t[9]);
-    if (!date) return null;
-    if (t.len < 19 or (t[10] != 'T' and t[10] != ' ')) return 10;
-    const time = isDigit(t[11]) and isDigit(t[12]) and t[13] == ':' and
-        isDigit(t[14]) and isDigit(t[15]) and t[16] == ':' and
-        isDigit(t[17]) and isDigit(t[18]);
-    if (!time) return 10;
+/// Whether a match starting here is a token of its own rather than part of a
+/// larger one. Without this, `gpt-4o-2024-08-06` loses its date and every
+/// dated model snapshot collapses onto one key.
+fn isBoundary(prev: ?u8) bool {
+    const c = prev orelse return true;
+    return !(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.');
+}
+
+fn twoDigits(text: []const u8, at: usize) ?u8 {
+    if (!isDigit(text[at]) or !isDigit(text[at + 1])) return null;
+    return (text[at] - '0') * 10 + (text[at + 1] - '0');
+}
+
+/// `2026-08-31`, optionally followed by `T14:22:03` and fractional or zone bytes.
+fn matchTimestamp(text: []const u8, prev: ?u8) ?usize {
+    if (!isBoundary(prev) or text.len < 10) return null;
+    for (0..4) |i| {
+        if (!isDigit(text[i])) return null;
+    }
+    if (text[4] != '-' or text[7] != '-') return null;
+    const month = twoDigits(text, 5) orelse return null;
+    const day = twoDigits(text, 8) orelse return null;
+    // Range-checked so an ordinary dashed identifier is not read as a date.
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+
+    if (text.len < 19 or (text[10] != 'T' and text[10] != ' ')) {
+        if (text.len > 10 and (std.ascii.isAlphanumeric(text[10]) or text[10] == '-')) return null;
+        return 10;
+    }
+    const has_time = isDigit(text[11]) and isDigit(text[12]) and text[13] == ':' and
+        isDigit(text[14]) and isDigit(text[15]) and text[16] == ':' and
+        isDigit(text[17]) and isDigit(text[18]);
+    if (!has_time) return 10;
+
     var n: usize = 19;
-    while (n < t.len and (t[n] == 'Z' or t[n] == '.' or isDigit(t[n]))) n += 1;
+    while (n < text.len and (text[n] == 'Z' or text[n] == '.' or isDigit(text[n]))) n += 1;
     return n;
 }
 
-fn matchUuid(t: []const u8) ?usize {
+fn matchUuid(text: []const u8, prev: ?u8) ?usize {
     const len = 36;
-    if (t.len < len) return null;
-    for (t[0..len], 0..) |c, i| {
+    if (!isBoundary(prev) or text.len < len) return null;
+    for (text[0..len], 0..) |c, i| {
         const ok = switch (i) {
             8, 13, 18, 23 => c == '-',
             else => isHex(c),
         };
         if (!ok) return null;
     }
+    if (text.len > len and (isHex(text[len]) or text[len] == '-')) return null;
     return len;
 }
 
-fn matchAbsPath(t: []const u8) ?usize {
-    const prefixes = [_][]const u8{ "/Users/", "/home/", "/private/tmp/", "/tmp/" };
-    for (prefixes) |p| {
-        if (t.len >= p.len and std.mem.eql(u8, t[0..p.len], p)) {
-            var n = p.len;
-            while (n < t.len and t[n] != '"' and t[n] != ' ' and t[n] != ',' and t[n] != '\n') n += 1;
-            return n;
-        }
+/// Only the machine-varying root is replaced. Consuming the whole path made
+/// `/Users/me/main.zig` and `/Users/me/build.zig` the same key.
+fn matchHomeDir(text: []const u8) ?usize {
+    for ([_][]const u8{ "/Users/", "/home/" }) |root| {
+        if (!std.mem.startsWith(u8, text, root)) continue;
+        var n = root.len;
+        while (n < text.len and text[n] != '/' and text[n] != '"' and text[n] != ' ') n += 1;
+        // `/Users` with no user segment is not a home directory.
+        return if (n == root.len) null else n;
     }
     return null;
 }
 
 const testing = std.testing;
 
+fn keyOf(target: Target, body: []const u8, options: Options) ![]u8 {
+    return key(testing.allocator, target, body, options);
+}
+
 fn expectSame(a: []const u8, b: []const u8) !void {
-    const ka = try key(testing.allocator, a, &all_scrubbers, &.{});
+    const ka = try keyOf(.{}, a, .{});
     defer testing.allocator.free(ka);
-    const kb = try key(testing.allocator, b, &all_scrubbers, &.{});
+    const kb = try keyOf(.{}, b, .{});
     defer testing.allocator.free(kb);
     try testing.expectEqualStrings(ka, kb);
 }
 
 fn expectDiffers(a: []const u8, b: []const u8) !void {
-    const ka = try key(testing.allocator, a, &all_scrubbers, &.{});
+    const ka = try keyOf(.{}, a, .{});
     defer testing.allocator.free(ka);
-    const kb = try key(testing.allocator, b, &all_scrubbers, &.{});
+    const kb = try keyOf(.{}, b, .{});
     defer testing.allocator.free(kb);
     try testing.expect(!std.mem.eql(u8, ka, kb));
 }
@@ -262,9 +355,7 @@ test "integer and float zero are one temperature" {
 test "whitespace does not matter" {
     try expectSame(
         \\{"model":"m","messages":[]}
-    ,
-        "{\n  \"model\": \"m\",\n  \"messages\": []\n}",
-    );
+    , "{\n  \"model\": \"m\",\n  \"messages\": []\n}");
 }
 
 test "injected date is scrubbed" {
@@ -283,7 +374,7 @@ test "injected uuid is scrubbed" {
     );
 }
 
-test "absolute path is scrubbed across machines" {
+test "home directory is scrubbed across machines" {
     try expectSame(
         \\{"c":"read /Users/tunardev/app/src/main.zig"}
     ,
@@ -331,31 +422,6 @@ test "extra conversation turn must not collide" {
     );
 }
 
-test "scrubbing keeps surrounding text distinct" {
-    try expectDiffers(
-        \\{"c":"from 2026-01-01 to 2026-02-01 summarize"}
-    ,
-        \\{"c":"from 2026-01-01 to 2026-02-01 translate"}
-    );
-}
-
-test "scrubbers can be disabled" {
-    const a = try key(testing.allocator,
-        \\{"system":"Today is 2026-08-31T14:22:03Z"}
-    , &.{}, &.{});
-    defer testing.allocator.free(a);
-    const b = try key(testing.allocator,
-        \\{"system":"Today is 2026-09-01T09:03:41Z"}
-    , &.{}, &.{});
-    defer testing.allocator.free(b);
-    try testing.expect(!std.mem.eql(u8, a, b));
-}
-
-test "non json body matches itself and nothing else" {
-    try expectSame("not json at all", "not json at all");
-    try expectDiffers("not json at all", "also not json");
-}
-
 test "large integers keep full precision" {
     try expectDiffers(
         \\{"n":9007199254740993}
@@ -364,56 +430,144 @@ test "large integers keep full precision" {
     );
 }
 
-fn keyIgnoring(body: []const u8, ignore: []const []const u8) ![]u8 {
-    return key(testing.allocator, body, &all_scrubbers, ignore);
+// Every case below reproduced a real collision before the encoding was
+// length-prefixed and the scrubbers were bounded.
+
+test "a string value cannot forge structure" {
+    try expectDiffers(
+        \\{"a":"1","b":"2"}
+    ,
+        \\{"a":"1\",b:\"2"}
+    );
+}
+
+test "an object key cannot forge structure" {
+    try expectDiffers(
+        \\{"x":1,"y":2}
+    ,
+        \\{"x:1,y":2}
+    );
+}
+
+test "different files under one home directory stay distinct" {
+    try expectDiffers(
+        \\{"c":"read /Users/me/src/main.zig"}
+    ,
+        \\{"c":"read /Users/me/src/build.zig"}
+    );
+}
+
+test "a path used as an object key does not swallow its value" {
+    try expectDiffers(
+        \\{"/tmp/a":1}
+    ,
+        \\{"/tmp/b":999}
+    );
+}
+
+test "dated model snapshots stay distinct" {
+    try expectDiffers(
+        \\{"model":"gpt-4o-2024-08-06","messages":[]}
+    ,
+        \\{"model":"gpt-4o-2024-11-20","messages":[]}
+    );
+}
+
+test "placeholder text cannot impersonate a scrubbed value" {
+    try expectDiffers(
+        \\{"c":"/Users/me/x"}
+    ,
+        \\{"c":"<HOME>/x"}
+    );
+}
+
+test "a non-json body cannot collide with an encoded one" {
+    try expectDiffers(
+        \\{"a":"1"}
+    , "j o1:k1:a s1:1");
+}
+
+test "a large float still encodes rather than falling back" {
+    // A 40-byte buffer made this abandon canonicalisation silently.
+    const k = try keyOf(.{}, "{\"n\":1e40}", .{});
+    defer testing.allocator.free(k);
+    try testing.expect(std.mem.startsWith(u8, k, "m4:POST"));
+    try testing.expect(std.mem.indexOf(u8, k, "10000000000000000000000000000000000000000") != null);
+}
+
+test "an out of range date is not treated as a timestamp" {
+    try expectDiffers(
+        \\{"id":"9999-99-99"}
+    ,
+        \\{"id":"1234-56-78"}
+    );
+}
+
+test "method provider and path are part of the identity" {
+    const a = try keyOf(.{ .method = "POST", .provider = "anthropic", .path = "/v1/messages/AAA/cancel" }, "", .{});
+    defer testing.allocator.free(a);
+    const b = try keyOf(.{ .method = "POST", .provider = "anthropic", .path = "/v1/messages/BBB/cancel" }, "", .{});
+    defer testing.allocator.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
+
+    const get = try keyOf(.{ .method = "GET", .provider = "anthropic", .path = "/v1/models" }, "", .{});
+    defer testing.allocator.free(get);
+    const post = try keyOf(.{ .method = "POST", .provider = "anthropic", .path = "/v1/models" }, "", .{});
+    defer testing.allocator.free(post);
+    try testing.expect(!std.mem.eql(u8, get, post));
+
+    const one = try keyOf(.{ .provider = "openai", .path = "/v1/chat/completions" }, "{\"m\":1}", .{});
+    defer testing.allocator.free(one);
+    const two = try keyOf(.{ .provider = "groq", .path = "/v1/chat/completions" }, "{\"m\":1}", .{});
+    defer testing.allocator.free(two);
+    try testing.expect(!std.mem.eql(u8, one, two));
+}
+
+test "a credential in the query string never reaches the key" {
+    const k = try keyOf(.{ .provider = "gemini", .path = "/v1/models/x?key=AIzaSyREALSECRET" }, "", .{});
+    defer testing.allocator.free(k);
+    try testing.expect(std.mem.indexOf(u8, k, "AIzaSyREALSECRET") == null);
+    // The parameter's presence still matters, only its value is dropped.
+    const without = try keyOf(.{ .provider = "gemini", .path = "/v1/models/x" }, "", .{});
+    defer testing.allocator.free(without);
+    try testing.expect(!std.mem.eql(u8, k, without));
+}
+
+test "query parameter order does not matter" {
+    const a = try keyOf(.{ .path = "/v1/x?alpha=1&beta=2" }, "", .{});
+    defer testing.allocator.free(a);
+    const b = try keyOf(.{ .path = "/v1/x?beta=2&alpha=1" }, "", .{});
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
 }
 
 test "an ignored field stops affecting the key" {
-    const a =
-        \\{"model":"m","metadata":{"request_id":"abc"}}
-    ;
-    const b =
-        \\{"model":"m","metadata":{"request_id":"xyz"}}
-    ;
     const with = [_][]const u8{"metadata.request_id"};
-
-    const ka = try keyIgnoring(a, &with);
-    defer testing.allocator.free(ka);
-    const kb = try keyIgnoring(b, &with);
-    defer testing.allocator.free(kb);
-    try testing.expectEqualStrings(ka, kb);
-
-    const na = try keyIgnoring(a, &.{});
-    defer testing.allocator.free(na);
-    const nb = try keyIgnoring(b, &.{});
-    defer testing.allocator.free(nb);
-    try testing.expect(!std.mem.eql(u8, na, nb));
+    const a = try keyOf(.{}, "{\"model\":\"m\",\"metadata\":{\"request_id\":\"abc\"}}", .{ .ignore = &with });
+    defer testing.allocator.free(a);
+    const b = try keyOf(.{}, "{\"model\":\"m\",\"metadata\":{\"request_id\":\"xyz\"}}", .{ .ignore = &with });
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
 }
 
 test "a nested ignore path does not drop a top level field of the same name" {
-    const a =
-        \\{"b":"top","a":{"b":"nested"}}
-    ;
-    const b =
-        \\{"b":"CHANGED","a":{"b":"nested"}}
-    ;
     const ignore = [_][]const u8{"a.b"};
-    const ka = try keyIgnoring(a, &ignore);
-    defer testing.allocator.free(ka);
-    const kb = try keyIgnoring(b, &ignore);
-    defer testing.allocator.free(kb);
-    // Only `a.b` is ignored, so the top-level `b` must still separate these.
-    try testing.expect(!std.mem.eql(u8, ka, kb));
+    const a = try keyOf(.{}, "{\"b\":\"top\",\"a\":{\"b\":\"nested\"}}", .{ .ignore = &ignore });
+    defer testing.allocator.free(a);
+    const b = try keyOf(.{}, "{\"b\":\"CHANGED\",\"a\":{\"b\":\"nested\"}}", .{ .ignore = &ignore });
+    defer testing.allocator.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
 }
 
-test "ignoring a path that does not exist is harmless" {
-    const body =
-        \\{"model":"m"}
-    ;
-    const ignore = [_][]const u8{"nope.not.here"};
-    const k1 = try keyIgnoring(body, &ignore);
-    defer testing.allocator.free(k1);
-    const k2 = try keyIgnoring(body, &.{});
-    defer testing.allocator.free(k2);
-    try testing.expectEqualStrings(k1, k2);
+test "scrubbers can be disabled" {
+    const a = try keyOf(.{}, "{\"s\":\"2026-08-31T14:22:03Z\"}", .{ .scrubbers = &.{} });
+    defer testing.allocator.free(a);
+    const b = try keyOf(.{}, "{\"s\":\"2026-09-01T09:03:41Z\"}", .{ .scrubbers = &.{} });
+    defer testing.allocator.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "a non json body matches itself and nothing else" {
+    try expectSame("not json at all", "not json at all");
+    try expectDiffers("not json at all", "also not json");
 }

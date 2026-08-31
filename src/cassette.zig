@@ -108,9 +108,14 @@ pub const Cassette = struct {
             if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
             // One stable error for a corrupt file, rather than whichever
             // internal name std.json happened to raise.
-            const e = parseLine(gpa, line) catch return error.CorruptCassette;
-            try c.entries.put(gpa, e.key, e);
+            const e = try parseLine(gpa, line);
+            errdefer e.deinit(gpa);
+            // `insert`, not `put`: `put` keeps the original key slice and
+            // leaks the entry it displaces.
+            try c.insert(e);
         }
+        // Loading is not a modification; only a later insert makes it dirty.
+        c.dirty = false;
         return c;
     }
 
@@ -181,104 +186,96 @@ fn lessThanSlice(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
+/// The on-disk shape of one line.
+///
+/// Serialised by `std.json` rather than by hand: a hand-rolled writer emitted
+/// bytes it had not validated, and one non-UTF-8 header value produced a
+/// cassette that could never be loaded again.
+const Wire = struct {
+    key: []const u8,
+    status: u16,
+    headers: []const Header,
+    encoding: []const u8,
+    body: []const u8,
+    chunked: bool = false,
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    model: []const u8 = "",
+};
+
 fn writeLine(gpa: std.mem.Allocator, e: Exchange, out: *std.ArrayList(u8)) !void {
-    try out.appendSlice(gpa, "{\"key\":");
-    try writeJsonString(gpa, e.key, out);
-    var num: [8]u8 = undefined;
-    try out.appendSlice(gpa, ",\"status\":");
-    try out.appendSlice(gpa, try std.fmt.bufPrint(&num, "{d}", .{e.status}));
-    try out.appendSlice(gpa, ",\"headers\":[");
-    for (e.headers, 0..) |h, i| {
-        if (i > 0) try out.append(gpa, ',');
-        try out.appendSlice(gpa, "{\"name\":");
-        try writeJsonString(gpa, h.name, out);
-        try out.appendSlice(gpa, ",\"value\":");
-        try writeJsonString(gpa, h.value, out);
-        try out.append(gpa, '}');
-    }
-    try out.appendSlice(gpa, "],\"input_tokens\":");
-    try out.appendSlice(gpa, try std.fmt.bufPrint(&num, "{d}", .{e.input_tokens}));
-    try out.appendSlice(gpa, ",\"output_tokens\":");
-    var num2: [24]u8 = undefined;
-    try out.appendSlice(gpa, try std.fmt.bufPrint(&num2, "{d}", .{e.output_tokens}));
-    try out.appendSlice(gpa, ",\"model\":");
-    try writeJsonString(gpa, e.model, out);
-    try out.appendSlice(gpa, ",\"chunked\":");
-    try out.appendSlice(gpa, if (e.chunked) "true" else "false");
-    try out.appendSlice(gpa, ",\"encoding\":");
-    switch (e.body) {
-        .text => |t| {
-            try out.appendSlice(gpa, "\"text\",\"body\":");
-            try writeJsonString(gpa, t, out);
+    const line = try std.json.Stringify.valueAlloc(gpa, Wire{
+        .key = e.key,
+        .status = e.status,
+        .headers = e.headers,
+        .encoding = switch (e.body) {
+            .text => "text",
+            .base64 => "base64",
         },
-        .base64 => |b| {
-            try out.appendSlice(gpa, "\"base64\",\"body\":");
-            try writeJsonString(gpa, b, out);
+        .body = switch (e.body) {
+            .text, .base64 => |payload| payload,
         },
-    }
-    try out.append(gpa, '}');
+        .chunked = e.chunked,
+        .input_tokens = e.input_tokens,
+        .output_tokens = e.output_tokens,
+        .model = e.model,
+    }, .{});
+    defer gpa.free(line);
+    try out.appendSlice(gpa, line);
 }
 
-fn writeJsonString(gpa: std.mem.Allocator, s: []const u8, out: *std.ArrayList(u8)) !void {
-    try out.append(gpa, '"');
-    for (s) |c| switch (c) {
-        '"' => try out.appendSlice(gpa, "\\\""),
-        '\\' => try out.appendSlice(gpa, "\\\\"),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\r' => try out.appendSlice(gpa, "\\r"),
-        '\t' => try out.appendSlice(gpa, "\\t"),
-        else => {
-            if (c < 0x20) {
-                var esc: [6]u8 = undefined;
-                try out.appendSlice(gpa, try std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}));
-            } else {
-                try out.append(gpa, c);
-            }
-        },
-    };
-    try out.append(gpa, '"');
-}
-
+/// Every field is type-checked by `std.json`, so a hand-edited or
+/// merge-mangled line is an error rather than a panic.
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Exchange {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+    const parsed = std.json.parseFromSlice(Wire, gpa, line, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.CorruptCassette;
     defer parsed.deinit();
-    const obj = parsed.value.object;
+    const w = parsed.value;
 
-    const key = try gpa.dupe(u8, obj.get("key").?.string);
+    const body: Body = if (std.mem.eql(u8, w.encoding, "text"))
+        .{ .text = try gpa.dupe(u8, w.body) }
+    else if (std.mem.eql(u8, w.encoding, "base64")) blk: {
+        // Decoded here so a corrupt payload fails at load with everything
+        // else, rather than replaying silently as an empty body.
+        const dec = std.base64.standard.Decoder;
+        const n = dec.calcSizeForSlice(w.body) catch return error.CorruptCassette;
+        const raw = try gpa.alloc(u8, n);
+        defer gpa.free(raw);
+        dec.decode(raw, w.body) catch return error.CorruptCassette;
+        break :blk .{ .base64 = try gpa.dupe(u8, w.body) };
+    } else return error.CorruptCassette;
+    errdefer body.deinit(gpa);
+
+    const key = try gpa.dupe(u8, w.key);
     errdefer gpa.free(key);
-    const status: u16 = @intCast(obj.get("status").?.integer);
+    const model = try gpa.dupe(u8, w.model);
+    errdefer gpa.free(model);
 
-    const raw_headers = obj.get("headers").?.array;
-    const headers = try gpa.alloc(Header, raw_headers.items.len);
-    errdefer gpa.free(headers);
-    for (raw_headers.items, 0..) |h, i| {
-        headers[i] = .{
-            .name = try gpa.dupe(u8, h.object.get("name").?.string),
-            .value = try gpa.dupe(u8, h.object.get("value").?.string),
-        };
+    const headers = try gpa.alloc(Header, w.headers.len);
+    var filled: usize = 0;
+    errdefer {
+        for (headers[0..filled]) |h| {
+            gpa.free(h.name);
+            gpa.free(h.value);
+        }
+        gpa.free(headers);
+    }
+    for (w.headers, 0..) |h, i| {
+        const name = try gpa.dupe(u8, h.name);
+        errdefer gpa.free(name);
+        headers[i] = .{ .name = name, .value = try gpa.dupe(u8, h.value) };
+        filled = i + 1;
     }
 
-    const payload = obj.get("body").?.string;
-    const body: Body = if (std.mem.eql(u8, obj.get("encoding").?.string, "text"))
-        .{ .text = try gpa.dupe(u8, payload) }
-    else
-        .{ .base64 = try gpa.dupe(u8, payload) };
-
-    const chunked = if (obj.get("chunked")) |v| v.bool else false;
-    const input_tokens: u64 = if (obj.get("input_tokens")) |v| @intCast(v.integer) else 0;
-    const output_tokens: u64 = if (obj.get("output_tokens")) |v| @intCast(v.integer) else 0;
-    const model = if (obj.get("model")) |v|
-        try gpa.dupe(u8, v.string)
-    else
-        try gpa.dupe(u8, "");
     return .{
         .key = key,
-        .status = status,
+        .status = w.status,
         .headers = headers,
         .body = body,
-        .chunked = chunked,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
+        .chunked = w.chunked,
+        .input_tokens = w.input_tokens,
+        .output_tokens = w.output_tokens,
         .model = model,
     };
 }

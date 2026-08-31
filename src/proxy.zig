@@ -39,6 +39,8 @@ pub const Stats = struct {
     recorded: usize = 0,
     replayed: usize = 0,
     missed: usize = 0,
+    /// Requests tapedeck itself could not complete.
+    failed: usize = 0,
     /// Tokens actually bought this run.
     spent_input: u64 = 0,
     spent_output: u64 = 0,
@@ -139,7 +141,17 @@ pub const Proxy = struct {
     /// behind the slowest upstream response.
     pub fn serve(p: *Proxy) void {
         while (p.running.load(.seq_cst)) {
-            const stream = p.server.accept(p.io) catch break;
+            const stream = p.server.accept(p.io) catch |e| switch (e) {
+                // Transient: a peer that hung up before we accepted, or a
+                // momentary fd shortage. Ending the loop here would leave the
+                // listener open and every later request hanging.
+                error.ConnectionAborted,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.SystemResources,
+                => continue,
+                else => break,
+            };
             if (!p.running.load(.seq_cst)) {
                 stream.close(p.io);
                 break;
@@ -210,9 +222,9 @@ pub const Proxy = struct {
     fn handle(p: *Proxy, req: *http.Server.Request) !void {
         const gpa = p.gpa;
 
-        // `head.target` and the header values point into the connection's read
-        // buffer, which draining the body reuses. Copy anything still needed
-        // afterwards before the first body read.
+        // `head.target` and the header values point into the connection read
+        // buffer, which draining the body reuses. Copy anything needed after
+        // that read before the first one.
         const method = req.head.method;
         const target = try gpa.dupe(u8, req.head.target);
         defer gpa.free(target);
@@ -233,25 +245,43 @@ pub const Proxy = struct {
             });
         }
 
-        var body_buf: [16 * 1024]u8 = undefined;
-        const body_reader = req.readerExpectNone(&body_buf);
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(gpa);
-        var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = body_reader.readSliceShort(&chunk) catch break;
-            if (n == 0) break;
-            try body.appendSlice(gpa, chunk[0..n]);
+        if (method.requestHasBody()) {
+            var body_buf: [16 * 1024]u8 = undefined;
+            // curl sends `Expect: 100-continue` for larger bodies, and
+            // `readerExpectNone` asserts the header is absent.
+            const body_reader = if (req.head.expect != null)
+                try req.readerExpectContinue(&body_buf)
+            else
+                req.readerExpectNone(&body_buf);
+            var chunk: [4096]u8 = undefined;
+            while (true) {
+                const n = body_reader.readSliceShort(&chunk) catch {
+                    p.bump(.failed);
+                    return fail(req, "client request body was truncated");
+                };
+                if (n == 0) break;
+                try body.appendSlice(gpa, chunk[0..n]);
+            }
         }
 
         const split = splitPrefix(target) orelse {
+            p.bump(.failed);
             return fail(req, "no provider prefix in request path");
         };
         const base = p.baseFor(split.prefix) orelse {
+            p.bump(.failed);
             return fail(req, "unknown provider prefix");
         };
 
-        const entry_key = try matching.key(gpa, body.items, &matching.all_scrubbers, p.ignore);
+        // The body alone is not an identity: two bodyless POSTs to different
+        // paths would otherwise share one cassette entry.
+        const entry_key = try matching.key(gpa, .{
+            .method = @tagName(method),
+            .provider = split.prefix,
+            .path = split.rest,
+        }, body.items, .{ .ignore = p.ignore });
         defer gpa.free(entry_key);
 
         if (p.mode != .rerecord) {
@@ -272,8 +302,12 @@ pub const Proxy = struct {
             .path = split.rest,
             .headers = headers.items,
             .body = body.items,
-        }) catch {
-            return fail(req, "upstream request failed");
+        }) catch |e| {
+            p.bump(.failed);
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "upstream request failed: {s}", .{@errorName(e)}) catch
+                "upstream request failed";
+            return fail(req, msg);
         };
         defer got.deinit(gpa);
 
@@ -338,13 +372,14 @@ pub const Proxy = struct {
         try p.cassette.insert(e);
     }
 
-    fn bump(p: *Proxy, comptime field: enum { recorded, replayed, missed }) void {
+    fn bump(p: *Proxy, comptime field: enum { recorded, replayed, missed, failed }) void {
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
         switch (field) {
             .recorded => p.stats.recorded += 1,
             .replayed => p.stats.replayed += 1,
             .missed => p.stats.missed += 1,
+            .failed => p.stats.failed += 1,
         }
     }
 
@@ -453,12 +488,19 @@ test "split prefix separates provider from path" {
     try testing.expectEqualStrings("/v1/messages", s.rest);
 }
 
-test "split prefix rejects paths without a provider" {
-    try testing.expect(splitPrefix("/v1/messages") == null or
-        !std.mem.eql(u8, splitPrefix("/v1/messages").?.prefix, "anthropic"));
+test "split prefix takes the first segment as the provider" {
+    // `/v1/messages` is not rejected: `v1` becomes the provider and is then
+    // refused by `baseFor` because no such provider is configured.
+    const s = splitPrefix("/v1/messages").?;
+    try testing.expectEqualStrings("v1", s.prefix);
+    try testing.expectEqualStrings("/messages", s.rest);
+}
+
+test "split prefix rejects paths with no segments" {
     try testing.expect(splitPrefix("/") == null);
     try testing.expect(splitPrefix("") == null);
     try testing.expect(splitPrefix("//v1") == null);
+    try testing.expect(splitPrefix("no-leading-slash") == null);
 }
 
 const Fake = struct {
