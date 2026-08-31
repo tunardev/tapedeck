@@ -1,0 +1,10 @@
+//! Record LLM API traffic to cassettes and replay it for tests.
+
+pub const matching = @import("matching.zig");
+pub const paths = @import("paths.zig");
+pub const redact = @import("redact.zig");
+pub const cassette = @import("cassette.zig");
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}
