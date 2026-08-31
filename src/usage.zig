@@ -1,15 +1,8 @@
-//! Token counts pulled out of a provider's own response.
-//!
-//! Counts come from the provider, so they are always right. Dollar figures do
-//! not live here — prices change without notice, and a confidently wrong cost
-//! is the same class of failure as a wrong replay.
-
 const std = @import("std");
 
 pub const Usage = struct {
     input: u64 = 0,
     output: u64 = 0,
-    /// Empty when the response did not name one.
     model: []const u8 = "",
 
     pub fn isEmpty(u: Usage) bool {
@@ -17,11 +10,6 @@ pub const Usage = struct {
     }
 };
 
-/// Read usage out of `body`. Never fails: an unparseable body reports zeroes
-/// rather than breaking a run over accounting.
-///
-/// `model` borrows from `body`, so it lives exactly as long as the caller's
-/// buffer does.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) Usage {
     if (std.mem.indexOf(u8, body, "data:") != null and
         std.mem.indexOf(u8, body, "\n") != null)
@@ -33,7 +21,6 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) Usage {
     return parseObject(gpa, body) orelse .{};
 }
 
-/// SSE: usage is spread across events, so accumulate rather than take the first.
 fn parseStream(gpa: std.mem.Allocator, body: []const u8) ?Usage {
     var out: Usage = .{};
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -44,7 +31,6 @@ fn parseStream(gpa: std.mem.Allocator, body: []const u8) ?Usage {
         if (payload.len == 0 or payload[0] != '{') continue;
         const u = parseObject(gpa, payload) orelse continue;
         if (u.input > 0) out.input = u.input;
-        // Anthropic reports a running output count; the last one is the total.
         if (u.output > 0) out.output = u.output;
         if (u.model.len > 0) out.model = u.model;
     }
@@ -61,7 +47,6 @@ fn parseObject(gpa: std.mem.Allocator, text: []const u8) ?Usage {
 
     var out: Usage = .{};
     if (stringAt(root, "model")) |m| out.model = m;
-    // Anthropic nests the first usage report inside `message`.
     if (root.get("message")) |m| switch (m) {
         .object => |o| {
             if (stringAt(o, "model")) |name| out.model = name;
@@ -72,7 +57,6 @@ fn parseObject(gpa: std.mem.Allocator, text: []const u8) ?Usage {
     if (root.get("usage")) |u| readUsage(u, &out);
     if (root.get("usageMetadata")) |u| readUsage(u, &out);
 
-    // `model` borrows from the parsed document, which is about to be freed.
     if (out.model.len > 0) {
         const start = std.mem.indexOf(u8, text, out.model) orelse {
             out.model = "";
@@ -152,7 +136,6 @@ test "anthropic streamed usage accumulates across events" {
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":88}}\n\n";
     const u = parse(testing.allocator, sse);
     try testing.expectEqual(@as(u64, 200), u.input);
-    // The final running total, not the first report.
     try testing.expectEqual(@as(u64, 88), u.output);
     try testing.expectEqualStrings("claude-opus-5", u.model);
 }

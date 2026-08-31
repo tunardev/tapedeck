@@ -1,42 +1,20 @@
-//! Match keys for cassette lookup.
-//!
-//! Two runs of the same call must produce one key; two different calls must
-//! never produce the same key. The second matters more — a missed match costs
-//! an API call, a wrong match is a green test that proves nothing. Where the
-//! two conflict, this module misses.
-//!
-//! The encoding is length-prefixed rather than delimited, so no byte inside a
-//! value can be read as structure. A delimited form let `{"x":1,"y":2}` and
-//! `{"x:1,y":2}` render identically.
-
 const std = @import("std");
 
-/// Volatile spans replaced inside string values.
-///
-/// Applied per value during encoding, never to the assembled output: scrubbing
-/// joined text let a path swallow the separator between a key and its value.
 pub const Scrubber = enum { timestamp, uuid, home_dir };
 
 pub const all_scrubbers = [_]Scrubber{ .timestamp, .uuid, .home_dir };
 
-/// What the request was, beyond its body.
-///
-/// The body alone is not an identity: two `POST .../batches/{id}/cancel` calls
-/// carry equal empty bodies and must not replay each other.
 pub const Target = struct {
     method: []const u8 = "POST",
     provider: []const u8 = "",
-    /// Path including any query string, as received.
     path: []const u8 = "",
 };
 
 pub const Options = struct {
     scrubbers: []const Scrubber = &all_scrubbers,
-    /// Dotted JSON paths dropped before the key is formed.
     ignore: []const []const u8 = &.{},
 };
 
-/// The key a cassette entry is stored and looked up under. Caller owns it.
 pub fn key(
     gpa: std.mem.Allocator,
     target: Target,
@@ -51,12 +29,8 @@ pub fn key(
     try writePath(gpa, &out, target.path);
 
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |e| switch (e) {
-        // Out of memory must not silently produce a different key for the same
-        // body; only a genuine parse failure falls back.
         error.OutOfMemory => return e,
         else => {
-            // Hex, so a binary request body cannot put non-UTF-8 bytes into a
-            // key that is later written to a JSON cassette line.
             const hex = try gpa.alloc(u8, body.len * 2);
             defer gpa.free(hex);
             _ = std.fmt.bufPrint(hex, "{x}", .{body}) catch unreachable;
@@ -71,8 +45,6 @@ pub fn key(
     return out.toOwnedSlice(gpa);
 }
 
-/// Query values are dropped and only their names kept: Gemini authenticates
-/// with `?key=`, so a verbatim path would write a credential to disk.
 fn writePath(gpa: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8) !void {
     const split = std.mem.indexOfScalar(u8, path, '?');
     try writeScalar(gpa, out, 'u', if (split) |i| path[0..i] else path, &.{});
@@ -106,8 +78,6 @@ fn writeValue(
             try writeScalar(gpa, out, 'n', std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable, &.{});
         },
         .float => |f| {
-            // std.fmt.float.bufferSize(.decimal, f64) is 347; a 40-byte buffer
-            // made 1e40 fail to encode and silently change the key.
             var buf: [347]u8 = undefined;
             const text = if (f == @trunc(f) and @abs(f) < 9007199254740992.0) blk: {
                 const as_int: i64 = @intFromFloat(f);
@@ -130,14 +100,10 @@ fn writeValue(
                 names[kept] = name;
                 kept += 1;
             }
-            // std.json preserves document order, so this sort is what makes the
-            // key stable rather than something the parser happens to supply.
             std.mem.sortUnstable([]const u8, names[0..kept], {}, lessThan);
 
             try writeCount(gpa, out, 'o', kept);
             for (names[0..kept]) |name| {
-                // Keys are never scrubbed: two paths used as keys would reduce
-                // to one name and collide inside a single object.
                 try writeScalar(gpa, out, 'k', name, &.{});
                 const child = if (prefix.len == 0)
                     try gpa.dupe(u8, name)
@@ -151,14 +117,9 @@ fn writeValue(
 }
 
 fn writeCount(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, n: usize) !void {
-    var buf: [24]u8 = undefined;
-    try out.append(gpa, tag);
-    try out.appendSlice(gpa, std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable);
-    try out.append(gpa, ':');
+    try out.print(gpa, "{c}{d}:", .{ tag, n });
 }
 
-/// `<tag><byte length>:<bytes>`. The length is what makes the encoding
-/// unambiguous — the bytes that follow are never scanned for structure.
 fn writeScalar(
     gpa: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -170,10 +131,7 @@ fn writeScalar(
     defer scrubbed.deinit(gpa);
     try scrub(gpa, &scrubbed, text, scrubbers);
 
-    var buf: [24]u8 = undefined;
-    try out.append(gpa, tag);
-    try out.appendSlice(gpa, std.fmt.bufPrint(&buf, "{d}", .{scrubbed.items.len}) catch unreachable);
-    try out.append(gpa, ':');
+    try out.print(gpa, "{c}{d}:", .{ tag, scrubbed.items.len });
     try out.appendSlice(gpa, scrubbed.items);
 }
 
@@ -195,9 +153,6 @@ fn isIgnored(prefix: []const u8, name: []const u8, ignore: []const []const u8) b
     return false;
 }
 
-/// Every pattern is ASCII, so byte-wise scanning copies multi-byte UTF-8
-/// through untouched. A literal `<` is doubled so ordinary text cannot
-/// impersonate a placeholder and collide with a scrubbed value.
 fn scrub(
     gpa: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -248,9 +203,6 @@ fn isHex(c: u8) bool {
     return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
 }
 
-/// Whether a match starting here is a token of its own rather than part of a
-/// larger one. Without this, `gpt-4o-2024-08-06` loses its date and every
-/// dated model snapshot collapses onto one key.
 fn isBoundary(prev: ?u8) bool {
     const c = prev orelse return true;
     return !(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.');
@@ -261,7 +213,6 @@ fn twoDigits(text: []const u8, at: usize) ?u8 {
     return (text[at] - '0') * 10 + (text[at + 1] - '0');
 }
 
-/// `2026-08-31`, optionally followed by `T14:22:03` and fractional or zone bytes.
 fn matchTimestamp(text: []const u8, prev: ?u8) ?usize {
     if (!isBoundary(prev) or text.len < 10) return null;
     for (0..4) |i| {
@@ -270,7 +221,6 @@ fn matchTimestamp(text: []const u8, prev: ?u8) ?usize {
     if (text[4] != '-' or text[7] != '-') return null;
     const month = twoDigits(text, 5) orelse return null;
     const day = twoDigits(text, 8) orelse return null;
-    // Range-checked so an ordinary dashed identifier is not read as a date.
     if (month < 1 or month > 12 or day < 1 or day > 31) return null;
 
     if (text.len < 19 or (text[10] != 'T' and text[10] != ' ')) {
@@ -301,14 +251,11 @@ fn matchUuid(text: []const u8, prev: ?u8) ?usize {
     return len;
 }
 
-/// Only the machine-varying root is replaced. Consuming the whole path made
-/// `/Users/me/main.zig` and `/Users/me/build.zig` the same key.
 fn matchHomeDir(text: []const u8) ?usize {
     for ([_][]const u8{ "/Users/", "/home/" }) |root| {
         if (!std.mem.startsWith(u8, text, root)) continue;
         var n = root.len;
         while (n < text.len and text[n] != '/' and text[n] != '"' and text[n] != ' ') n += 1;
-        // `/Users` with no user segment is not a home directory.
         return if (n == root.len) null else n;
     }
     return null;
@@ -430,9 +377,6 @@ test "large integers keep full precision" {
     );
 }
 
-// Every case below reproduced a real collision before the encoding was
-// length-prefixed and the scrubbers were bounded.
-
 test "a string value cannot forge structure" {
     try expectDiffers(
         \\{"a":"1","b":"2"}
@@ -488,7 +432,6 @@ test "a non-json body cannot collide with an encoded one" {
 }
 
 test "a large float still encodes rather than falling back" {
-    // A 40-byte buffer made this abandon canonicalisation silently.
     const k = try keyOf(.{}, "{\"n\":1e40}", .{});
     defer testing.allocator.free(k);
     try testing.expect(std.mem.startsWith(u8, k, "m4:POST"));
@@ -527,7 +470,6 @@ test "a credential in the query string never reaches the key" {
     const k = try keyOf(.{ .provider = "gemini", .path = "/v1/models/x?key=AIzaSyREALSECRET" }, "", .{});
     defer testing.allocator.free(k);
     try testing.expect(std.mem.indexOf(u8, k, "AIzaSyREALSECRET") == null);
-    // The parameter's presence still matters, only its value is dropped.
     const without = try keyOf(.{ .provider = "gemini", .path = "/v1/models/x" }, "", .{});
     defer testing.allocator.free(without);
     try testing.expect(!std.mem.eql(u8, k, without));

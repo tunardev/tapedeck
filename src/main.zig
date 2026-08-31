@@ -10,8 +10,6 @@ const proxy_mod = tapedeck.proxy;
 const runner = tapedeck.runner;
 const Paths = paths_mod.Paths;
 
-/// Reserved for tapedeck's own failures, well clear of the 0-125 range a
-/// wrapped command is likely to use, so CI can tell the two apart.
 const exit_tapedeck_error: u8 = 120;
 const exit_usage: u8 = 121;
 
@@ -59,22 +57,17 @@ const Invocation = struct {
     cassette: []const u8 = "default",
 };
 
-/// An option value that looks like a flag is a mistake, not a name.
-/// `tapedeck --cassette --strict -- pytest` used to record live against the
-/// real API under a cassette called "--strict".
-fn optionValue(args: []const []const u8, i: *usize, flag: []const u8) ?[]const u8 {
+fn optionValue(args: []const []const u8, i: *usize) ?[]const u8 {
     i.* += 1;
     if (i.* >= args.len) return null;
     const v = args[i.*];
     if (v.len > 0 and v[0] == '-') return null;
-    _ = flag;
     return v;
 }
 
 fn parse(args: []const []const u8, env_cassette: ?[]const u8) !Invocation {
     var inv: Invocation = .{ .command = .help };
     if (env_cassette) |name| {
-        // An empty variable in a CI matrix means unset, not "".
         if (name.len > 0) inv.cassette = name;
     }
     var mode_set = false;
@@ -93,7 +86,6 @@ fn parse(args: []const []const u8, env_cassette: ?[]const u8) !Invocation {
             if (mode_set) return error.ConflictingModes;
             inv.mode = .rerecord;
             mode_set = true;
-            // An optional selector: a bare `--rerecord` refreshes everything.
             if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-' and
                 !std.mem.eql(u8, args[i + 1], "--"))
             {
@@ -101,7 +93,7 @@ fn parse(args: []const []const u8, env_cassette: ?[]const u8) !Invocation {
                 inv.rerecord_id = args[i];
             }
         } else if (std.mem.eql(u8, a, "--cassette")) {
-            inv.cassette = optionValue(args, &i, a) orelse return error.MissingOptionValue;
+            inv.cassette = optionValue(args, &i) orelse return error.MissingOptionValue;
         } else if (std.mem.eql(u8, a, "--version")) {
             inv.command = .version;
             return inv;
@@ -115,11 +107,11 @@ fn parse(args: []const []const u8, env_cassette: ?[]const u8) !Invocation {
             inv.command = .ls;
             return inv;
         } else if (std.mem.eql(u8, a, "show")) {
-            if (optionValue(args, &i, a)) |name| inv.cassette = name;
+            if (optionValue(args, &i)) |name| inv.cassette = name;
             inv.command = .show;
             return inv;
         } else if (std.mem.eql(u8, a, "key")) {
-            inv.command = .{ .key = optionValue(args, &i, a) orelse return error.MissingOptionValue };
+            inv.command = .{ .key = optionValue(args, &i) orelse return error.MissingOptionValue };
             return inv;
         } else {
             return error.UnknownArgument;
@@ -168,8 +160,6 @@ fn run(init: std.process.Init) !void {
             printLine(io, dir);
         },
         .key => |body| {
-            // The proxy applies `ignore`; a diagnostic that skipped it would
-            // print a key the proxy never uses.
             const k = try matching.key(gpa, .{}, body, .{ .ignore = cfg.ignore });
             defer gpa.free(k);
             printLine(io, k);
@@ -241,8 +231,6 @@ fn wrap(
     const serving = try std.Thread.spawn(.{}, proxy_mod.Proxy.serve, .{&proxy});
     const result = runner.run(io, command, env, injected);
 
-    // Shut down and flush on every path: an error here still leaves recordings
-    // that were already paid for, and losing them is the worst outcome.
     proxy.shutdown();
     serving.join();
     proxy.flush() catch |e| {
@@ -256,7 +244,6 @@ fn wrap(
     std.process.exit(try result);
 }
 
-/// An unknown `--rerecord` selector is a typo, not a request to refresh nothing.
 fn requireEntry(gpa: std.mem.Allocator, io: Io, path: []const u8, id: []const u8) !void {
     var c = try cassette_mod.Cassette.load(gpa, io, path);
     defer c.deinit();
@@ -282,8 +269,6 @@ fn report(gpa: std.mem.Allocator, io: Io, mode: proxy_mod.Mode, s: proxy_mod.Sta
     if (s.recorded > 0) try printField(gpa, &out, s.recorded, "recorded");
     if (s.replayed > 0) try printField(gpa, &out, s.replayed, "replayed");
     if (s.recorded == 0 and s.replayed == 0) try printField(gpa, &out, 0, "calls");
-    // Only shown when non-zero, so a clean run stays quiet and a broken one
-    // is the only thing that draws the eye.
     if (s.missed > 0) try printField(gpa, &out, s.missed, "missed");
     if (s.failed > 0) try printField(gpa, &out, s.failed, "failed");
 
@@ -309,7 +294,6 @@ fn printField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: usize, label: 
     try out.print(gpa, "{s: >6} {s: <9}", .{ digits.items, label });
 }
 
-/// Thousands separators: `812443` is a number to decode, `812,443` is one to read.
 fn printGrouped(gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: u64) !void {
     var buf: [24]u8 = undefined;
     const digits = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
@@ -342,8 +326,6 @@ fn list(gpa: std.mem.Allocator, io: Io, home: Paths, cfg: config_mod.Config) !vo
         defer gpa.free(full);
 
         var c = cassette_mod.Cassette.load(gpa, io, full) catch {
-            // Naming it is the point; hiding it would report the user's data
-            // as absent.
             try out.print(gpa, "{s: <20}  unreadable\n", .{name});
             continue;
         };
@@ -361,11 +343,13 @@ fn list(gpa: std.mem.Allocator, io: Io, home: Paths, cfg: config_mod.Config) !vo
             }
         }
 
-        try out.print(gpa, "{s: <20} {d: >5} entries ", .{ name, c.count() });
-        try out.print(gpa, "{d: >10} tokens", .{tokens});
+        var grouped: std.ArrayList(u8) = .empty;
+        defer grouped.deinit(gpa);
+        try printGrouped(gpa, &grouped, tokens);
+        try out.print(gpa, "{s: <20} {d: >5} entries {s: >12} tokens", .{
+            name, c.count(), grouped.items,
+        });
         if (dollars > 0) {
-            // Marked when some entries had no price, so a partial total is
-            // never mistaken for the whole cost.
             try out.print(gpa, "  ${d:.4}{s}", .{ dollars, if (unpriced > 0) "+" else "" });
         }
         try out.append(gpa, '\n');
@@ -431,7 +415,6 @@ fn printErr(io: Io, text: []const u8) void {
 const testing = std.testing;
 
 test "a flag is never taken as an option value" {
-    // `--cassette --strict` once recorded live under a cassette named "--strict".
     try testing.expectError(error.MissingOptionValue, parse(&.{ "--cassette", "--strict", "--", "x" }, null));
 }
 

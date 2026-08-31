@@ -1,8 +1,3 @@
-//! Failure injection: every way tapedeck can break needs a defined outcome.
-//!
-//! This sits between a test suite and a paid API, so "crashes" and "silently
-//! records nothing" are both unacceptable answers.
-
 const std = @import("std");
 const Io = std.Io;
 const tapedeck = @import("tapedeck");
@@ -31,13 +26,10 @@ test "a truncated cassette is a clear error, not a silent empty one" {
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     const path = dir ++ "/default.jsonl";
 
-    // A run killed mid-write could leave half a line.
     try writeFile(io, path,
         \\{"key":"k","status":200,"headers":[],"encoding":"text","bo
     );
 
-    // Loading must fail loudly. Returning an empty cassette would turn a
-    // corrupt file into a silent re-record of everything.
     try testing.expectError(error.CorruptCassette, Cassette.load(testing.allocator, io, path));
 }
 
@@ -50,7 +42,6 @@ test "a cassette with an unknown field still loads" {
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     const path = dir ++ "/default.jsonl";
 
-    // A cassette written by a newer tapedeck must not break an older one.
     try writeFile(io, path,
         \\{"key":"k","status":200,"headers":[],"encoding":"text","body":"hi","future_field":42}
     );
@@ -72,7 +63,6 @@ test "a cassette missing the newer fields loads with defaults" {
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     const path = dir ++ "/default.jsonl";
 
-    // Exactly the shape M1 wrote, before chunked and usage existed.
     try writeFile(io, path,
         \\{"key":"k","status":200,"headers":[],"encoding":"text","body":"hi"}
     );
@@ -114,17 +104,13 @@ test "a cassette directory that cannot be created surfaces an error" {
 
     const dir = ".tapedeck-fail-perm";
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    // A regular file where the cassette directory should be.
     try writeFile(io, dir ++ "/blocker", "x");
 
-    // A path whose parent is a regular file must report, not panic.
     try testing.expect(std.meta.isError(
         Cassette.load(testing.allocator, io, dir ++ "/blocker/nested/default.jsonl"),
     ));
 }
 
-// Valid JSON of the wrong shape used to panic rather than return an error,
-// and catch cannot intercept a panic.
 test "wrong-shaped cassette lines are errors, not panics" {
     var t: Io.Threaded = .init(testing.allocator, .{});
     defer t.deinit();
@@ -180,8 +166,6 @@ test "a binary request body produces a cassette that reloads" {
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     const path = dir ++ "/c.jsonl";
 
-    // The key derived from a non-JSON body once carried raw bytes straight
-    // into the line, producing a file std.json could never parse again.
     const entry_key = try matching.key(gpa, .{}, &[_]u8{ 0xFF, 0xFE, 0x00 }, .{});
     defer gpa.free(entry_key);
 
@@ -219,8 +203,6 @@ test "a large token count does not break saving" {
         .headers = try gpa.alloc(tapedeck.cassette.Header, 0),
         .body = try tapedeck.cassette.Body.fromBytes(gpa, "hi"),
         .model = try gpa.dupe(u8, "m"),
-        // An 8-byte format buffer failed above 99,999,999 and discarded the
-        // whole run's recordings.
         .input_tokens = 4_000_000_000,
         .output_tokens = 4_000_000_000,
     });
@@ -240,7 +222,6 @@ test "a duplicate key in a cassette does not leak" {
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     const path = dir ++ "/c.jsonl";
 
-    // What a badly resolved merge conflict on a committed cassette looks like.
     try writeFile(io, path,
         \\{"key":"k","status":200,"headers":[{"name":"a","value":"b"}],"encoding":"text","body":"one"}
         \\{"key":"k","status":200,"headers":[{"name":"a","value":"b"}],"encoding":"text","body":"two"}

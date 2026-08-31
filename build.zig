@@ -7,9 +7,6 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("tapedeck", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        // Without this the library compiles at the default mode regardless of
-        // -Doptimize, so releases shipped Debug library code and no test ever
-        // ran in the configuration that ships.
         .optimize = optimize,
     });
 
@@ -30,7 +27,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run tapedeck");
     run_step.dependOn(&run_cmd.step);
 
-    // The end-to-end tests drive the shipped binary, so they need its path.
     const e2e_options = b.addOptions();
     e2e_options.addOptionPath("exe_path", exe.getEmittedBin());
     const e2e_tests = b.addTest(.{

@@ -1,12 +1,6 @@
-//! Spawning the wrapped command with the proxy's environment.
-
 const std = @import("std");
 const Io = std.Io;
 
-/// Run `argv` with `extra` added to `env`, and return its exit code.
-///
-/// stdin, stdout and stderr are inherited, so the wrapped test runner's output
-/// and TTY detection behave exactly as if tapedeck were not in the way.
 pub fn run(
     io: Io,
     argv: []const []const u8,
@@ -22,8 +16,6 @@ pub fn run(
     });
     const term = try child.wait(io);
 
-    // A child killed by a signal has no exit code. The shell's 128+signal
-    // convention keeps the result nonzero, which is what a caller acts on.
     return switch (term) {
         .exited => |code| code,
         .signal => |sig| 128 +| @as(u8, @truncate(@intFromEnum(sig))),

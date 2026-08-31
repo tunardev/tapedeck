@@ -1,18 +1,9 @@
-//! Optional `config.json` in the tapedeck home directory.
-//!
-//! JSON rather than TOML because `std.json` exists and a TOML parser would be
-//! this project's first dependency, for a file most users never open.
-
 const std = @import("std");
 const Io = std.Io;
 
 pub const Provider = struct {
-    /// First path segment that selects this provider.
     name: []const u8,
-    /// Real API root.
     base: []const u8,
-    /// Environment variable the provider's SDK reads. Not derived from `name`
-    /// because vendors do not agree on the pattern.
     env: []const u8,
 };
 
@@ -22,7 +13,6 @@ pub const defaults = [_]Provider{
     .{ .name = "gemini", .base = "https://generativelanguage.googleapis.com", .env = "GOOGLE_GEMINI_BASE_URL" },
 };
 
-/// Dollars per million tokens.
 pub const Price = struct {
     model: []const u8,
     input: f64,
@@ -30,24 +20,12 @@ pub const Price = struct {
 };
 
 pub const Config = struct {
-    /// Heap-allocated: an `ArenaAllocator` handed out by value loses the
-    /// pointer its own `allocator()` captured, and the arena leaks.
     arena: *std.heap.ArenaAllocator,
     providers: []const Provider,
-    /// Dotted JSON paths dropped from the match key.
     ignore: []const []const u8,
-    /// Per-model prices. Absent by default: a shipped price table goes stale
-    /// silently, and a confidently wrong dollar figure is worse than none.
     pricing: []const Price,
-    /// Store a hash of the request instead of the request itself. Matching is
-    /// unaffected; readable diffs are the cost. Off by default because a
-    /// reviewable cassette is usually worth more than an opaque one.
     hash_keys: bool = false,
 
-    /// Dollars for these tokens, or null when the model has no configured price.
-    ///
-    /// Longest-prefix, because providers report dated snapshot ids: a user who
-    /// prices `claude-opus-4` means that to cover `claude-opus-4-20250514`.
     pub fn cost(c: Config, model: []const u8, input: u64, output: u64) ?f64 {
         var best: ?Price = null;
         for (c.pricing) |p| {
@@ -66,9 +44,6 @@ pub const Config = struct {
         gpa.destroy(c.arena);
     }
 
-    /// Load `<dir>/config.json`. A missing file yields the defaults; a
-    /// malformed one is an error, because silently falling back to defaults
-    /// would hide a typo that changes which calls match.
     pub fn load(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Config {
         const arena = try gpa.create(std.heap.ArenaAllocator);
         errdefer gpa.destroy(arena);
@@ -95,8 +70,6 @@ pub const Config = struct {
             else => return error.MalformedConfig,
         };
 
-        // A misspelled key would otherwise be silently ignored, which is
-        // exactly the typo this file promises to catch.
         const known = [_][]const u8{ "providers", "ignore", "pricing", "hash_keys" };
         for (root.keys()) |name| {
             var ok = false;
@@ -168,10 +141,6 @@ pub const Config = struct {
 
         return .{
             .arena = arena,
-            // A declared provider list replaces the defaults, so a user can
-            // front only what they actually call.
-            // An explicitly empty list is a statement, and different from
-            // omitting the key.
             .providers = if (root.get("providers") != null)
                 try providers.toOwnedSlice(a)
             else
@@ -188,11 +157,9 @@ fn floatField(o: std.json.ObjectMap, name: []const u8) ?f64 {
     const f: f64 = switch (v) {
         .float => |x| x,
         .integer => |n| @floatFromInt(n),
-        // An overflowing or non-finite literal arrives as a string.
         .number_string => |s| std.fmt.parseFloat(f64, s) catch return null,
         else => return null,
     };
-    // A negative or non-finite price would print a confident nonsense total.
     if (!std.math.isFinite(f) or f < 0) return null;
     return f;
 }
@@ -261,7 +228,6 @@ test "ignore paths are read" {
     defer c.deinit();
     try testing.expectEqual(@as(usize, 2), c.ignore.len);
     try testing.expectEqualStrings("metadata.request_id", c.ignore[0]);
-    // No providers declared, so the defaults still apply.
     try testing.expectEqual(defaults.len, c.providers.len);
 }
 
@@ -301,11 +267,9 @@ test "pricing is read and applied per model" {
     defer c.deinit();
     try testing.expectEqual(@as(usize, 1), c.pricing.len);
 
-    // 1M input at $15 plus 1M output at $75.
     const total = c.cost("claude-opus-5", 1_000_000, 1_000_000).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), total, 0.0001);
 
-    // An unpriced model reports no cost rather than a wrong one.
     try testing.expect(c.cost("some-other-model", 1000, 1000) == null);
 }
 
@@ -315,7 +279,6 @@ test "an unknown top level key is rejected rather than ignored" {
     const io = t.io();
     const dir = ".tapedeck-cfg-typo";
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    // A silently ignored `ignores` would change which calls match.
     try writeConfig(io, dir,
         \\{"ignores":["metadata.request_id"]}
     );
@@ -349,9 +312,7 @@ test "pricing matches the longest configured prefix" {
     var c = try Config.load(testing.allocator, io, dir);
     defer c.deinit();
 
-    // Providers report dated snapshot ids; an exact match would price nothing.
     try testing.expectApproxEqAbs(@as(f64, 15.0), c.cost("claude-opus-4-20250514", 1_000_000, 0).?, 0.0001);
-    // The more specific entry wins where both apply.
     try testing.expectApproxEqAbs(@as(f64, 30.0), c.cost("claude-opus-4-1-20260101", 1_000_000, 0).?, 0.0001);
     try testing.expect(c.cost("gpt-5", 1000, 1000) == null);
 }

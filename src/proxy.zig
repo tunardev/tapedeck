@@ -1,5 +1,3 @@
-//! The loopback listener that records and replays.
-
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -14,24 +12,13 @@ const usage_mod = @import("usage.zig");
 const Cassette = cassette_mod.Cassette;
 const Exchange = cassette_mod.Exchange;
 
-/// Status returned for tapedeck's own failures.
-///
-/// Deliberately outside the range any provider uses, so a test that sees it
-/// knows the tool failed rather than the API.
 const tapedeck_error: u16 = 599;
 
-/// Ceiling on in-flight connection workers. Well above any realistic test
-/// runner's parallelism, low enough that a runaway client cannot exhaust threads.
 const max_workers: usize = 64;
 
 pub const Mode = enum {
-    /// Replay a hit, call upstream on a miss.
     record,
-    /// A miss is an error; never call out.
     strict,
-    /// Ignore existing entries and refresh every key this run touches.
-    /// Keys not seen are left alone, so refreshing one suite does not discard
-    /// everything else on the cassette.
     rerecord,
 };
 
@@ -39,24 +26,16 @@ pub const Stats = struct {
     recorded: usize = 0,
     replayed: usize = 0,
     missed: usize = 0,
-    /// Requests tapedeck itself could not complete.
     failed: usize = 0,
-    /// Tokens actually bought this run.
     spent_input: u64 = 0,
     spent_output: u64 = 0,
-    /// Tokens a replay avoided buying.
     saved_input: u64 = 0,
     saved_output: u64 = 0,
 };
 
 pub const Upstream = struct {
-    /// First path segment that selects this provider, e.g. `anthropic`.
     prefix: []const u8,
-    /// Real API root, e.g. `https://api.anthropic.com`.
     base: []const u8,
-    /// Environment variable the provider's SDK reads. Configured rather than
-    /// derived, because vendors do not agree on the pattern — Gemini reads
-    /// `GOOGLE_GEMINI_BASE_URL`, not `GEMINI_BASE_URL`.
     env: []const u8 = "",
 };
 
@@ -67,12 +46,8 @@ pub const Proxy = struct {
     port: u16,
     mode: Mode,
     upstreams: []const Upstream,
-    /// Dotted JSON paths excluded from the match key, from config.
     ignore: []const []const u8 = &.{},
-    /// Store a hash of the request rather than the request itself.
     hash_keys: bool = false,
-    /// When set, `rerecord` refreshes only the entry with this short id and
-    /// replays everything else, so fixing one call costs one call.
     rerecord_id: ?[]const u8 = null,
     cassette: Cassette,
     mutex: Io.Mutex = .init,
@@ -80,10 +55,6 @@ pub const Proxy = struct {
     running: std.atomic.Value(bool) = .init(true),
     workers: std.atomic.Value(usize) = .init(0),
 
-    /// Binds the first free port at or above `port_hint`.
-    ///
-    /// The listener is held for the proxy's whole life, so there is no window
-    /// between probing a port and claiming it.
     pub fn bind(
         gpa: std.mem.Allocator,
         io: Io,
@@ -120,8 +91,6 @@ pub const Proxy = struct {
         p.cassette.deinit();
     }
 
-    /// Environment pairs to inject into the child process.
-    /// Caller owns the returned slice and every string in it.
     pub fn baseUrls(p: *const Proxy, gpa: std.mem.Allocator) ![]const [2][]const u8 {
         const out = try gpa.alloc([2][]const u8, p.upstreams.len);
         errdefer gpa.free(out);
@@ -139,17 +108,9 @@ pub const Proxy = struct {
         return out;
     }
 
-    /// Serve until `shutdown` is called. Blocking; run it on its own thread.
-    ///
-    /// One worker per connection: a test runner with parallel workers issues
-    /// concurrent calls, and handling them inline would serialise every one
-    /// behind the slowest upstream response.
     pub fn serve(p: *Proxy) void {
         while (p.running.load(.seq_cst)) {
             const stream = p.server.accept(p.io) catch |e| switch (e) {
-                // Transient: a peer that hung up before we accepted, or a
-                // momentary fd shortage. Ending the loop here would leave the
-                // listener open and every later request hanging.
                 error.ConnectionAborted,
                 error.ProcessFdQuotaExceeded,
                 error.SystemFdQuotaExceeded,
@@ -167,13 +128,10 @@ pub const Proxy = struct {
                     continue;
                 } else |_| {}
             }
-            // At the cap, or out of threads: handle it here rather than drop it.
             _ = p.workers.fetchSub(1, .seq_cst);
             p.handleConnection(stream) catch {};
             stream.close(p.io);
         }
-        // Returning while workers still hold `p` would let the caller free it
-        // underneath them.
         while (p.workers.load(.seq_cst) > 0) {
             p.io.sleep(.fromMilliseconds(1), .awake) catch break;
         }
@@ -185,11 +143,6 @@ pub const Proxy = struct {
         p.handleConnection(stream) catch {};
     }
 
-    /// Unblocks a thread parked in `accept`.
-    ///
-    /// `shutdown` on a listening socket does not reliably wake `accept` on
-    /// macOS, so the flag is followed by one throwaway connection that the
-    /// loop observes and exits on.
     pub fn shutdown(p: *Proxy) void {
         p.running.store(false, .seq_cst);
         const addr: net.IpAddress = net.IpAddress.parseIp4("127.0.0.1", p.port) catch return;
@@ -203,7 +156,6 @@ pub const Proxy = struct {
         return p.stats;
     }
 
-    /// Flush the cassette if anything was recorded.
     pub fn flush(p: *Proxy) !void {
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
@@ -219,17 +171,12 @@ pub const Proxy = struct {
 
         var req = server.receiveHead() catch return;
         p.handle(&req) catch {};
-        // `respond` fills the connection writer's buffer; without this the
-        // client blocks forever waiting for bytes that never leave the process.
         writer.interface.flush() catch {};
     }
 
     fn handle(p: *Proxy, req: *http.Server.Request) !void {
         const gpa = p.gpa;
 
-        // `head.target` and the header values point into the connection read
-        // buffer, which draining the body reuses. Copy anything needed after
-        // that read before the first one.
         const method = req.head.method;
         const target = try gpa.dupe(u8, req.head.target);
         defer gpa.free(target);
@@ -254,8 +201,6 @@ pub const Proxy = struct {
         defer body.deinit(gpa);
         if (method.requestHasBody()) {
             var body_buf: [16 * 1024]u8 = undefined;
-            // curl sends `Expect: 100-continue` for larger bodies, and
-            // `readerExpectNone` asserts the header is absent.
             const body_reader = if (req.head.expect != null)
                 try req.readerExpectContinue(&body_buf)
             else
@@ -280,8 +225,6 @@ pub const Proxy = struct {
             return fail(req, "unknown provider prefix");
         };
 
-        // The body alone is not an identity: two bodyless POSTs to different
-        // paths would otherwise share one cassette entry.
         const canonical = try matching.key(gpa, .{
             .method = @tagName(method),
             .provider = split.prefix,
@@ -335,7 +278,6 @@ pub const Proxy = struct {
         return p.respond(req, got.status, stored, .{ .text = got.body }, got.chunked);
     }
 
-    /// Whether this key must go upstream regardless of what is on the cassette.
     fn shouldRefresh(p: *const Proxy, entry_key: []const u8) bool {
         if (p.mode != .rerecord) return false;
         const want = p.rerecord_id orelse return true;
@@ -371,7 +313,6 @@ pub const Proxy = struct {
         for (got.headers, 0..) |h, i| {
             headers[i] = .{
                 .name = try gpa.dupe(u8, h.name),
-                // Redaction happens here, before the exchange can reach disk.
                 .value = try gpa.dupe(u8, redact.value(h.name, h.value)),
             };
         }
@@ -489,7 +430,6 @@ fn cloneExchange(gpa: std.mem.Allocator, e: Exchange) !Exchange {
 
 const Split = struct { prefix: []const u8, rest: []const u8 };
 
-/// `/anthropic/v1/messages` becomes `anthropic` + `/v1/messages`.
 pub fn splitPrefix(target: []const u8) ?Split {
     if (target.len == 0 or target[0] != '/') return null;
     const after = target[1..];
@@ -507,8 +447,6 @@ test "split prefix separates provider from path" {
 }
 
 test "split prefix takes the first segment as the provider" {
-    // `/v1/messages` is not rejected: `v1` becomes the provider and is then
-    // refused by `baseFor` because no such provider is configured.
     const s = splitPrefix("/v1/messages").?;
     try testing.expectEqualStrings("v1", s.prefix);
     try testing.expectEqualStrings("/messages", s.rest);
@@ -551,8 +489,6 @@ const Fake = struct {
                 stream.close(f.io);
                 break;
             }
-            // Concurrent, or the stub itself serialises what the proxy just
-            // parallelised and the timing assertion measures the wrong thing.
             _ = f.inflight.fetchAdd(1, .seq_cst);
             if (std.Thread.spawn(.{}, Fake.handle, .{ f, stream })) |th| {
                 th.detach();
@@ -706,12 +642,10 @@ test "records on first call and replays without touching upstream" {
     }
 
     {
-        // Fresh process would reload from disk; strict mode must never call out.
         var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39400);
         defer p.deinit();
         const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
 
-        // Same call, different key order: matching must still hit.
         const drifted =
             \\{"messages":[],"model":"m"}
         ;
@@ -812,7 +746,6 @@ test "a configured env name overrides the derived one" {
         }
         gpa.free(vars);
     }
-    // Deriving GEMINI_BASE_URL from the prefix would be wrong.
     try testing.expectEqualStrings("GOOGLE_GEMINI_BASE_URL", vars[0][0]);
 }
 
@@ -851,8 +784,6 @@ const ConcurrentCaller = struct {
     ok: bool = false,
 
     fn call(c: *ConcurrentCaller) void {
-        // Distinct bodies so every request is a cache miss and must reach the
-        // provider; identical bodies would replay and hide serialisation.
         var buf: [64]u8 = undefined;
         const body = std.fmt.bufPrint(&buf, "{{\"model\":\"m\",\"n\":{d}}}", .{c.index}) catch return;
         const got = callProxy(c.gpa, c.io, c.port, "/anthropic/v1/messages", body) catch return;
@@ -901,8 +832,6 @@ test "concurrent requests are not serialised behind each other" {
     p.shutdown();
     serving.join();
 
-    // Serial handling costs n*300ms; concurrent costs roughly one delay. The
-    // midpoint leaves generous headroom for a loaded CI runner.
     try testing.expect(elapsed_ms < 800);
 }
 
@@ -937,7 +866,6 @@ test "error status and body round trip exactly" {
         const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
         const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
         defer gpa.free(got.body);
-        // A 429 is data a suite may assert on, not a transport failure.
         try testing.expectEqual(@as(u16, 429), got.status);
         try testing.expectEqualStrings(envelope, got.body);
         try p.flush();
@@ -1006,7 +934,6 @@ test "a streamed response replays as streamed" {
         const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
         defer gpa.free(got.body);
         try testing.expectEqualStrings(sse, got.body);
-        // The replay must be framed the way the recording was.
         try testing.expect(got.chunked);
         p.shutdown();
         th.join();
@@ -1026,7 +953,6 @@ test "rerecord refreshes an entry instead of replaying it" {
         \\{"model":"m","messages":[]}
     ;
 
-    // First recording, from a provider returning "old".
     {
         var fake = try Fake.start(io, 39840, "data: old\n\n", 200);
         const ft = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
@@ -1047,7 +973,6 @@ test "rerecord refreshes an entry instead of replaying it" {
         th.join();
     }
 
-    // The prompt's answer changed upstream; rerecord must go and fetch it.
     {
         var fake = try Fake.start(io, 39860, "data: new\n\n", 200);
         const ft = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
@@ -1069,7 +994,6 @@ test "rerecord refreshes an entry instead of replaying it" {
         th.join();
     }
 
-    // And the refreshed answer is what replays afterwards.
     {
         const ups = [_]Upstream{.{ .prefix = "anthropic", .base = "http://127.0.0.1:1" }};
         var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39880);
@@ -1121,7 +1045,6 @@ test "hash_keys keeps the prompt out of the cassette" {
     defer gpa.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "PROPRIETARY PROMPT TEXT") == null);
 
-    // Replay must still hit, or the privacy option would cost correctness.
     var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39730);
     p.hash_keys = true;
     defer p.deinit();
@@ -1171,7 +1094,6 @@ test "a rerecord selector refreshes one entry and replays the rest" {
         th.join();
     }
 
-    // Take the id of the first entry only.
     var loaded = try Cassette.load(gpa, io, path);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.count());
@@ -1190,7 +1112,6 @@ test "a rerecord selector refreshes one entry and replays the rest" {
     th.join();
 
     const stats = p.snapshot();
-    // The whole point: fixing one call costs one call, not the whole suite.
     try testing.expectEqual(@as(usize, 1), stats.recorded);
     try testing.expectEqual(@as(usize, 1), stats.replayed);
     try testing.expectEqual(@as(usize, 1), fake.hits.load(.seq_cst) - before);

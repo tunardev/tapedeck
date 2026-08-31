@@ -1,18 +1,10 @@
-//! On-disk cassette format: JSON Lines, one exchange per line, sorted by key.
-
 const std = @import("std");
 const Io = std.Io;
 
-/// A recorded body.
-///
-/// Text is preferred so a cassette diffs readably in a pull request, but a
-/// response with one invalid UTF-8 sequence must still round-trip whole. This
-/// is the reason the body is never read as a string.
 pub const Body = union(enum) {
     text: []const u8,
     base64: []const u8,
 
-    /// Caller owns the returned body's memory.
     pub fn fromBytes(gpa: std.mem.Allocator, raw: []const u8) !Body {
         if (std.unicode.utf8ValidateSlice(raw)) {
             return .{ .text = try gpa.dupe(u8, raw) };
@@ -22,7 +14,6 @@ pub const Body = union(enum) {
         return .{ .base64 = enc.encode(buf, raw) };
     }
 
-    /// Caller owns the returned slice.
     pub fn toBytes(b: Body, gpa: std.mem.Allocator) ![]u8 {
         return switch (b) {
             .text => |t| gpa.dupe(u8, t),
@@ -46,10 +37,6 @@ pub const Body = union(enum) {
     }
 };
 
-/// Short, stable handle for one entry, shown by `ls` and `show` and accepted
-/// by `--rerecord`. Eight hex digits of a hash of the key: long enough that a
-/// collision inside one cassette is not a practical concern, short enough to
-/// type.
 pub fn shortId(key: []const u8) [8]u8 {
     var out: [8]u8 = undefined;
     const digest = std.hash.Wyhash.hash(0, key);
@@ -57,9 +44,6 @@ pub fn shortId(key: []const u8) [8]u8 {
     return out;
 }
 
-/// Opaque form of a key, for repositories where the cassette must not carry
-/// the prompt in plaintext. Matching is unaffected because the incoming
-/// request is hashed the same way; readable diffs are what is traded away.
 pub fn hashKey(gpa: std.mem.Allocator, key: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
@@ -71,20 +55,14 @@ pub const Header = struct {
     value: []const u8,
 };
 
-/// One recorded request/response pair.
 pub const Exchange = struct {
     key: []const u8,
     status: u16,
     headers: []const Header,
     body: Body,
-    /// Recorded without a content-length. Absent in cassettes written before
-    /// this field existed, which load as false.
     chunked: bool = false,
-    /// Tokens the provider reported. Zero when it reported none, and absent
-    /// in cassettes written before these fields existed.
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
-    /// Model the provider named, for pricing. Owned like the other strings.
     model: []const u8 = "",
 
     pub fn deinit(e: Exchange, gpa: std.mem.Allocator) void {
@@ -99,15 +77,12 @@ pub const Exchange = struct {
     }
 };
 
-/// A cassette file loaded into memory.
 pub const Cassette = struct {
     gpa: std.mem.Allocator,
     path: []const u8,
     entries: std.StringArrayHashMapUnmanaged(Exchange),
     dirty: bool,
 
-    /// A missing file is an empty cassette, not an error: the first run of a
-    /// new test suite has nothing recorded yet.
     pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Cassette {
         var c: Cassette = .{
             .gpa = gpa,
@@ -126,15 +101,10 @@ pub const Cassette = struct {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
-            // One stable error for a corrupt file, rather than whichever
-            // internal name std.json happened to raise.
             const e = try parseLine(gpa, line);
             errdefer e.deinit(gpa);
-            // `insert`, not `put`: `put` keeps the original key slice and
-            // leaks the entry it displaces.
             try c.insert(e);
         }
-        // Loading is not a modification; only a later insert makes it dirty.
         c.dirty = false;
         return c;
     }
@@ -153,27 +123,22 @@ pub const Cassette = struct {
         return c.entries.count();
     }
 
-    /// Entries in stored order. Callers must not free what they see.
     pub fn values(c: *const Cassette) []const Exchange {
         return c.entries.values();
     }
 
-    /// Takes ownership of `e`; replaces any entry with the same key.
     pub fn insert(c: *Cassette, e: Exchange) !void {
         if (c.entries.fetchSwapRemove(e.key)) |old| old.value.deinit(c.gpa);
         try c.entries.put(c.gpa, e.key, e);
         c.dirty = true;
     }
 
-    /// Write via a temporary file and rename, so an interrupted run leaves the
-    /// previous cassette intact rather than a truncated one.
     pub fn save(c: *Cassette, io: Io) !void {
         const cwd = Io.Dir.cwd();
         if (std.fs.path.dirname(c.path)) |parent| {
             try cwd.createDirPath(io, parent);
         }
 
-        // Sorted so a re-record produces a minimal diff rather than a reshuffle.
         const keys = try c.gpa.alloc([]const u8, c.entries.count());
         defer c.gpa.free(keys);
         for (c.entries.keys(), 0..) |k, i| keys[i] = k;
@@ -206,11 +171,6 @@ fn lessThanSlice(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-/// The on-disk shape of one line.
-///
-/// Serialised by `std.json` rather than by hand: a hand-rolled writer emitted
-/// bytes it had not validated, and one non-UTF-8 header value produced a
-/// cassette that could never be loaded again.
 const Wire = struct {
     key: []const u8,
     status: u16,
@@ -244,8 +204,6 @@ fn writeLine(gpa: std.mem.Allocator, e: Exchange, out: *std.ArrayList(u8)) !void
     try out.appendSlice(gpa, line);
 }
 
-/// Every field is type-checked by `std.json`, so a hand-edited or
-/// merge-mangled line is an error rather than a panic.
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Exchange {
     const parsed = std.json.parseFromSlice(Wire, gpa, line, .{
         .ignore_unknown_fields = true,
@@ -256,8 +214,6 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Exchange {
     const body: Body = if (std.mem.eql(u8, w.encoding, "text"))
         .{ .text = try gpa.dupe(u8, w.body) }
     else if (std.mem.eql(u8, w.encoding, "base64")) blk: {
-        // Decoded here so a corrupt payload fails at load with everything
-        // else, rather than replaying silently as an empty body.
         const dec = std.base64.standard.Decoder;
         const n = dec.calcSizeForSlice(w.body) catch return error.CorruptCassette;
         const raw = try gpa.alloc(u8, n);
@@ -366,7 +322,6 @@ test "utf8 body survives a round trip" {
     try testing.expectEqualStrings(raw, back);
 }
 
-/// Tests need a real `Io`; `Threaded` is the blocking one.
 fn testIo(t: *Io.Threaded) Io {
     t.* = .init(testing.allocator, .{});
     return t.io();

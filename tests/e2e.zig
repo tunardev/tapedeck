@@ -1,5 +1,3 @@
-//! End-to-end: the real binary, a fake provider, and a child process.
-
 const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
@@ -13,8 +11,6 @@ fn hitCount(io: Io, gpa: std.mem.Allocator, path: []const u8) !usize {
     return std.fmt.parseInt(usize, std.mem.trim(u8, text, " \n"), 10) catch 0;
 }
 
-/// A provider stub in python, so the test exercises the shipped binary rather
-/// than linking the proxy into the test process.
 const fake_py =
     \\import http.server, sys, os
     \\H_ = {"n": 0}
@@ -69,10 +65,8 @@ test "record then replay through the installed binary" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    // kill reaps the child; waiting again would assert on a cleared pid
     defer fake.kill(io);
 
-    // The stub needs a moment to bind before the first request.
     var waited: usize = 0;
     while (waited < 50) : (waited += 1) {
         const addr: Io.net.IpAddress = try .parseIp4("127.0.0.1", fake_port);
@@ -96,7 +90,6 @@ test "record then replay through the installed binary" {
         \\ -d "$PAYLOAD" -o "$OUT"
     ;
 
-    // Record.
     try env.put("OUT", work ++ "/out1.txt");
     try env.put("PAYLOAD", "{\"model\":\"m\",\"messages\":[]}");
     const rec = try std.process.run(gpa, io, .{
@@ -107,10 +100,8 @@ test "record then replay through the installed binary" {
     defer gpa.free(rec.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rec.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
-    // 120 input + 45 output, from the stub's anthropic-shaped usage events.
     try std.testing.expect(std.mem.indexOf(u8, rec.stderr, "165 tokens spent") != null);
 
-    // Replay: same logical call, drifted key order, strict so it cannot call out.
     try env.put("OUT", work ++ "/out2.txt");
     try env.put("PAYLOAD", "{\"messages\":[],\"model\":\"m\"}");
     const rep = try std.process.run(gpa, io, .{
@@ -121,7 +112,6 @@ test "record then replay through the installed binary" {
     defer gpa.free(rep.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rep.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
-    // The replay bought nothing, so the same 165 tokens were saved.
     try std.testing.expect(std.mem.indexOf(u8, rep.stderr, "165 tokens saved") != null);
 
     const a = try cwd.readFileAlloc(io, work ++ "/out1.txt", gpa, .limited(1 << 16));
@@ -156,7 +146,6 @@ test "child exit code becomes the process exit code" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, try child.wait(io));
 }
 
-/// Runs the binary and captures stdout.
 fn runCli(gpa: std.mem.Allocator, io: Io, home: []const u8, args: []const []const u8) ![]u8 {
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
@@ -235,7 +224,6 @@ test "a user declared provider works end to end" {
         try w.interface.flush();
     }
 
-    // A provider tapedeck has never heard of, reading a non-derivable env var.
     const home = work ++ "/.tapedeck";
     try cwd.createDirPath(io, home);
     {
@@ -283,7 +271,6 @@ test "a user declared provider works end to end" {
     try env.put("TAPEDECK_LOCAL_UPSTREAM", upstream);
     try env.put("OUT", work ++ "/out.txt");
 
-    // The client reads MY_LLM_URL, which only the config knows about.
     const client =
         \\curl -sS -X POST "$MY_LLM_URL/v1/chat" -H 'content-type: application/json' \
         \\ -d "$PAYLOAD" -o "$OUT"
@@ -297,10 +284,8 @@ test "a user declared provider works end to end" {
     defer gpa.free(rec.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rec.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
-    // 120 input + 45 output, from the stub's anthropic-shaped usage events.
     try std.testing.expect(std.mem.indexOf(u8, rec.stderr, "165 tokens spent") != null);
 
-    // Only the ignored field differs, so strict replay must still hit.
     try env.put("PAYLOAD", "{\"model\":\"m\",\"metadata\":{\"request_id\":\"second\"}}");
     var rep = try std.process.spawn(io, .{
         .argv = &.{ build_options.exe_path, "--strict", "--", "sh", "-c", client },
@@ -309,8 +294,6 @@ test "a user declared provider works end to end" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rep.wait(io));
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
 
-    // The hit count alone cannot tell a replay from a strict miss — a miss
-    // also leaves the provider untouched. Assert on what came back.
     const replayed = try cwd.readFileAlloc(io, work ++ "/out.txt", gpa, .limited(1 << 16));
     defer gpa.free(replayed);
     try std.testing.expectEqualStrings(sse, replayed);

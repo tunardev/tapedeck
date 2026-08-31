@@ -1,8 +1,5 @@
-//! Header redaction applied before anything reaches disk.
-
 const std = @import("std");
 
-/// Replacement value written in place of a secret.
 pub const redacted = "<REDACTED>";
 
 const secret_headers = [_][]const u8{
@@ -12,12 +9,9 @@ const secret_headers = [_][]const u8{
     "openai-organization",
     "openai-project",
     "cookie",
-    // responses carry credentials back under set-cookie, not cookie
     "set-cookie",
 };
 
-/// Whether a header carries a credential. Comparison is case-insensitive
-/// because HTTP header names are, and SDKs disagree on casing.
 pub fn isSecret(name: []const u8) bool {
     for (secret_headers) |h| {
         if (std.ascii.eqlIgnoreCase(name, h)) return true;
@@ -25,7 +19,6 @@ pub fn isSecret(name: []const u8) bool {
     return false;
 }
 
-/// The value to store for a header: either the original, or the placeholder.
 pub fn value(name: []const u8, original: []const u8) []const u8 {
     return if (isSecret(name)) redacted else original;
 }

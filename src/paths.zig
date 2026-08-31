@@ -1,10 +1,5 @@
-//! Where cassettes live.
-
 const std = @import("std");
 
-/// Cassettes are committed to the repository under test, so the default is
-/// project-relative rather than under the user's home. `TAPEDECK_HOME`
-/// overrides it, which is also how tests get an isolated directory.
 pub const Paths = struct {
     root: []const u8,
 
@@ -19,16 +14,11 @@ pub const Paths = struct {
         gpa.free(p.root);
     }
 
-    /// Caller owns the result.
     pub fn cassetteFile(p: Paths, gpa: std.mem.Allocator, name: []const u8) ![]u8 {
         return std.fs.path.join(gpa, &.{ p.root, "cassettes", name });
     }
 };
 
-/// A cassette name must be one safe path segment.
-///
-/// The name reaches this from a flag or an environment variable, so `../..`
-/// would otherwise let a caller write outside the cassette directory.
 pub fn sanitizeName(name: []const u8) ?[]const u8 {
     if (name.len == 0) return null;
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return null;
