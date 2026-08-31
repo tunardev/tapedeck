@@ -8,7 +8,7 @@ module under `src/`, **pinned to Zig 0.16.0** (`.zigversion`, and the CI job).
 
 ```sh
 zig build test --summary all   # --summary all matters: the test step is silent on success
-zig fmt --check src build.zig
+zig fmt --check src build.zig tests
 ```
 
 `zig build test` prints nothing when it passes, so a broken test *step* and a
@@ -35,8 +35,12 @@ Blog posts and older answers will not compile.
 | `src/root.zig` | Module root; re-exports everything below. |
 | `src/matching.zig` | Canonical JSON and scrubbers; turns a request body into a cassette key. |
 | `src/cassette.zig` | On-disk format, lossless body encoding, atomic save. |
+| `src/proxy.zig` | The loopback listener: route by provider prefix, replay or record. |
+| `src/upstream.zig` | Forwards one request to the real provider and drains the response. |
+| `src/runner.zig` | Spawns the wrapped command with the injected base URLs. |
 | `src/paths.zig` | Cassette directory resolution. |
 | `src/redact.zig` | Credential header classification. |
+| `tests/e2e.zig` | Drives the shipped binary against a python provider stub. |
 
 ## The invariant that governs matching
 
@@ -65,3 +69,25 @@ is project-relative (`./.tapedeck`), not under the user's home.
 Never write an API key into a cassette. Bodies are stored as text when valid
 UTF-8 and base64 otherwise — never read a captured body as a string, or one
 invalid byte discards the whole response.
+
+## Threading and shutdown
+
+The proxy runs its accept loop on a spawned thread. Three traps, all hit once
+already during M1:
+
+- `shutdown` on a listening socket does not wake `accept` on macOS. The proxy
+  sets its flag and then opens one throwaway connection to itself.
+- Zig `defer`s run last-declared-first. `defer thread.join()` must be declared
+  *before* `defer server.stop()`, or join waits on a loop nothing has stopped.
+- `Request.head.target` and its header values point into the connection read
+  buffer, which draining the body reuses. Copy anything needed after the body
+  read *before* the first read, or it is a segfault on reused memory.
+
+`respond` fills the connection writer's buffer but does not push it to the
+socket; the connection handler flushes explicitly or the client hangs forever.
+
+## build.zig.zon paths
+
+Keep every file the repo ships listed in `.paths`. Files outside it went
+missing from the working tree twice during M1. The cause was not proven, but
+docs belong there regardless.

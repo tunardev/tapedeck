@@ -43,8 +43,10 @@ See `src/matching.zig`.
 
 ## Status
 
-Early. Matching, cassette storage, and redaction are implemented and tested;
-the proxy is in progress.
+Working end to end for Anthropic and OpenAI: `tapedeck -- <cmd>` records,
+`tapedeck --strict -- <cmd>` replays and never calls out. Not yet implemented:
+conversation-scoped cassettes, selective re-record, `ls`/`show`, cost
+accounting, and providers beyond those two.
 
 Built in Zig 0.16 with **zero dependencies** — everything it needs is in the
 standard library, so `zig build` is the whole toolchain story and release

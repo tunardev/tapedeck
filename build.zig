@@ -26,9 +26,22 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run tapedeck");
     run_step.dependOn(&run_cmd.step);
 
+    // The end-to-end tests drive the shipped binary, so they need its path.
+    const e2e_options = b.addOptions();
+    e2e_options.addOptionPath("exe_path", exe.getEmittedBin());
+    const e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    e2e_tests.root_module.addOptions("build_options", e2e_options);
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(e2e_tests).step);
 }

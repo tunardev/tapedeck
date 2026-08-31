@@ -10,5 +10,9 @@
         "src",
         "LICENSE",
         "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "tests",
     },
 }

@@ -42,6 +42,9 @@ pub fn isHopHeader(name: []const u8) bool {
         "transfer-encoding",
         "connection",
         "host",
+        // changes on every recording, so keeping it makes re-record diffs
+        // pure noise without telling a reader anything
+        "date",
     };
     for (hop) |h| {
         if (std.ascii.eqlIgnoreCase(name, h)) return true;
@@ -140,6 +143,7 @@ test "hop headers are recognised case-insensitively" {
     try testing.expect(isHopHeader("content-length"));
     try testing.expect(isHopHeader("TRANSFER-ENCODING"));
     try testing.expect(isHopHeader("Host"));
+    try testing.expect(isHopHeader("Date"));
     try testing.expect(!isHopHeader("content-type"));
     try testing.expect(!isHopHeader("anthropic-version"));
 }
