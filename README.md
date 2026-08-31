@@ -23,6 +23,13 @@ language and any SDK works — Python, TypeScript, Go, Rust, Ruby, curl.
 In CI, `--strict` turns an unmatched request into a failure instead of a silent
 API call. No key in CI at all.
 
+```console
+$ tapedeck --cassette api -- pytest tests/api    # one cassette per suite
+$ tapedeck ls                                    # what is recorded
+$ tapedeck show api                              # what the model saw and returned
+$ tapedeck --rerecord -- pytest                  # refresh after a prompt change
+```
+
 ## Why not a general HTTP cassette library
 
 Agent loops compound. Turn N+1's request embeds turn N's response, so one

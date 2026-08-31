@@ -147,3 +147,60 @@ test "child exit code becomes the process exit code" {
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, try child.wait(io));
 }
+
+/// Runs the binary and captures stdout.
+fn runCli(gpa: std.mem.Allocator, io: Io, home: []const u8, args: []const []const u8) ![]u8 {
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin:/bin");
+    try env.put("TAPEDECK_HOME", home);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, build_options.exe_path);
+    try argv.appendSlice(gpa, args);
+
+    const res = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = &env,
+    });
+    gpa.free(res.stderr);
+    return res.stdout;
+}
+
+test "ls and show read a cassette written to disk" {
+    const gpa = std.testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const cwd = Io.Dir.cwd();
+
+    const home = ".tapedeck-e2e-ls";
+    cwd.deleteTree(io, home) catch {};
+    defer cwd.deleteTree(io, home) catch {};
+    try cwd.createDirPath(io, home ++ "/cassettes");
+
+    const line =
+        \\{"key":"k1","status":429,"headers":[{"name":"content-type","value":"application/json"}],"chunked":true,"encoding":"text","body":"slow down"}
+    ;
+    {
+        const f = try cwd.createFile(io, home ++ "/cassettes/api.jsonl", .{ .truncate = true });
+        defer f.close(io);
+        var buf: [1024]u8 = undefined;
+        var w = f.writer(io, &buf);
+        try w.interface.writeAll(line);
+        try w.interface.writeAll("\n");
+        try w.interface.flush();
+    }
+
+    const listed = try runCli(gpa, io, home, &.{"ls"});
+    defer gpa.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "1 entries") != null);
+
+    const shown = try runCli(gpa, io, home, &.{ "show", "api" });
+    defer gpa.free(shown);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "status 429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "(streamed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "slow down") != null);
+}
