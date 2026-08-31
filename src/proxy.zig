@@ -23,7 +23,16 @@ const tapedeck_error: u16 = 599;
 /// runner's parallelism, low enough that a runaway client cannot exhaust threads.
 const max_workers: usize = 64;
 
-pub const Mode = enum { record, strict };
+pub const Mode = enum {
+    /// Replay a hit, call upstream on a miss.
+    record,
+    /// A miss is an error; never call out.
+    strict,
+    /// Ignore existing entries and refresh every key this run touches.
+    /// Keys not seen are left alone, so refreshing one suite does not discard
+    /// everything else on the cassette.
+    rerecord,
+};
 
 pub const Stats = struct {
     recorded: usize = 0,
@@ -229,15 +238,16 @@ pub const Proxy = struct {
         const entry_key = try matching.key(gpa, body.items, &matching.all_scrubbers);
         defer gpa.free(entry_key);
 
-        if (p.lookup(entry_key)) |hit| {
-            defer hit.deinit(gpa);
-            p.bump(.replayed);
-            return p.respond(req, hit.status, hit.headers, hit.body, hit.chunked);
-        }
-
-        if (p.mode == .strict) {
-            p.bump(.missed);
-            return fail(req, "no cassette entry for this request");
+        if (p.mode != .rerecord) {
+            if (p.lookup(entry_key)) |hit| {
+                defer hit.deinit(gpa);
+                p.bump(.replayed);
+                return p.respond(req, hit.status, hit.headers, hit.body, hit.chunked);
+            }
+            if (p.mode == .strict) {
+                p.bump(.missed);
+                return fail(req, "no cassette entry for this request");
+            }
         }
 
         const got = upstream.forward(gpa, p.io, base, .{
@@ -869,6 +879,76 @@ test "a streamed response replays as streamed" {
         try testing.expectEqualStrings(sse, got.body);
         // The replay must be framed the way the recording was.
         try testing.expect(got.chunked);
+        p.shutdown();
+        th.join();
+    }
+}
+
+test "rerecord refreshes an entry instead of replaying it" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const dir = ".tapedeck-proxy-rerec";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const path = dir ++ "/cassettes/default.jsonl";
+    const body =
+        \\{"model":"m","messages":[]}
+    ;
+
+    // First recording, from a provider returning "old".
+    {
+        var fake = try Fake.start(io, 39840, "data: old\n\n", 200);
+        const ft = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+        defer ft.join();
+        defer fake.stop();
+        const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+        defer gpa.free(base);
+        const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+
+        var p = try Proxy.bind(gpa, io, path, .record, &ups, 39850);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try testing.expectEqualStrings("data: old\n\n", got.body);
+        try p.flush();
+        p.shutdown();
+        th.join();
+    }
+
+    // The prompt's answer changed upstream; rerecord must go and fetch it.
+    {
+        var fake = try Fake.start(io, 39860, "data: new\n\n", 200);
+        const ft = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+        defer ft.join();
+        defer fake.stop();
+        const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+        defer gpa.free(base);
+        const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+
+        var p = try Proxy.bind(gpa, io, path, .rerecord, &ups, 39870);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try testing.expectEqualStrings("data: new\n\n", got.body);
+        try testing.expectEqual(@as(usize, 1), fake.hits.load(.seq_cst));
+        try p.flush();
+        p.shutdown();
+        th.join();
+    }
+
+    // And the refreshed answer is what replays afterwards.
+    {
+        const ups = [_]Upstream{.{ .prefix = "anthropic", .base = "http://127.0.0.1:1" }};
+        var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39880);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try testing.expectEqualStrings("data: new\n\n", got.body);
         p.shutdown();
         th.join();
     }

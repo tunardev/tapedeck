@@ -119,6 +119,11 @@ pub const Cassette = struct {
         return c.entries.count();
     }
 
+    /// Entries in stored order. Callers must not free what they see.
+    pub fn values(c: *const Cassette) []const Exchange {
+        return c.entries.values();
+    }
+
     /// Takes ownership of `e`; replaces any entry with the same key.
     pub fn insert(c: *Cassette, e: Exchange) !void {
         if (c.entries.fetchSwapRemove(e.key)) |old| old.value.deinit(c.gpa);

@@ -25,7 +25,36 @@ pub const Paths = struct {
     }
 };
 
+/// A cassette name must be one safe path segment.
+///
+/// The name reaches this from a flag or an environment variable, so `../..`
+/// would otherwise let a caller write outside the cassette directory.
+pub fn sanitizeName(name: []const u8) ?[]const u8 {
+    if (name.len == 0) return null;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return null;
+    for (name) |c| {
+        if (c == '/' or c == '\\' or c < 0x20) return null;
+    }
+    return name;
+}
+
 const testing = std.testing;
+
+test "ordinary cassette names are accepted" {
+    try testing.expect(sanitizeName("default") != null);
+    try testing.expect(sanitizeName("api-tests") != null);
+    try testing.expect(sanitizeName("suite_2") != null);
+}
+
+test "traversal and separators are rejected" {
+    try testing.expect(sanitizeName("../escape") == null);
+    try testing.expect(sanitizeName("..") == null);
+    try testing.expect(sanitizeName(".") == null);
+    try testing.expect(sanitizeName("a/b") == null);
+    try testing.expect(sanitizeName("a\\b") == null);
+    try testing.expect(sanitizeName("") == null);
+    try testing.expect(sanitizeName("bad\nname") == null);
+}
 
 test "cassette files live under the root" {
     const p: Paths = .{ .root = "/somewhere/.tapedeck" };
