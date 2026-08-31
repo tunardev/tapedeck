@@ -62,95 +62,95 @@ pub const Config = struct {
             else => return e,
         };
 
-        const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch {
+        const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
             return error.MalformedConfig;
-        };
         const root = switch (parsed.value) {
             .object => |o| o,
             else => return error.MalformedConfig,
         };
-
-        const known = [_][]const u8{ "providers", "ignore", "pricing", "hash_keys" };
-        for (root.keys()) |name| {
-            var ok = false;
-            for (known) |k| ok = ok or std.mem.eql(u8, name, k);
-            if (!ok) return error.MalformedConfig;
-        }
-
-        const hash_keys = if (root.get("hash_keys")) |v| switch (v) {
-            .bool => |b| b,
-            else => return error.MalformedConfig,
-        } else false;
-
-        var providers: std.ArrayList(Provider) = .empty;
-        if (root.get("providers")) |v| {
-            const items = switch (v) {
-                .array => |arr| arr,
-                else => return error.MalformedConfig,
-            };
-            for (items.items) |item| {
-                const o = switch (item) {
-                    .object => |o| o,
-                    else => return error.MalformedConfig,
-                };
-                const name = stringField(o, "name") orelse return error.MalformedConfig;
-                const base = stringField(o, "base") orelse return error.MalformedConfig;
-                const env = stringField(o, "env") orelse return error.MalformedConfig;
-                try providers.append(a, .{
-                    .name = try a.dupe(u8, name),
-                    .base = try a.dupe(u8, base),
-                    .env = try a.dupe(u8, env),
-                });
-            }
-        }
-
-        var pricing: std.ArrayList(Price) = .empty;
-        if (root.get("pricing")) |v| {
-            const o = switch (v) {
-                .object => |o| o,
-                else => return error.MalformedConfig,
-            };
-            var it = o.iterator();
-            while (it.next()) |kv| {
-                const spec = switch (kv.value_ptr.*) {
-                    .object => |so| so,
-                    else => return error.MalformedConfig,
-                };
-                try pricing.append(a, .{
-                    .model = try a.dupe(u8, kv.key_ptr.*),
-                    .input = floatField(spec, "input") orelse return error.MalformedConfig,
-                    .output = floatField(spec, "output") orelse return error.MalformedConfig,
-                });
-            }
-        }
-
-        var ignore: std.ArrayList([]const u8) = .empty;
-        if (root.get("ignore")) |v| {
-            const items = switch (v) {
-                .array => |arr| arr,
-                else => return error.MalformedConfig,
-            };
-            for (items.items) |item| {
-                const s = switch (item) {
-                    .string => |s| s,
-                    else => return error.MalformedConfig,
-                };
-                try ignore.append(a, try a.dupe(u8, s));
-            }
-        }
+        try rejectUnknownKeys(root);
 
         return .{
             .arena = arena,
-            .providers = if (root.get("providers") != null)
-                try providers.toOwnedSlice(a)
+            .providers = if (root.get("providers")) |v|
+                try readProviders(a, v)
             else
                 try a.dupe(Provider, &defaults),
-            .ignore = try ignore.toOwnedSlice(a),
-            .pricing = try pricing.toOwnedSlice(a),
-            .hash_keys = hash_keys,
+            .ignore = if (root.get("ignore")) |v| try readIgnore(a, v) else &.{},
+            .pricing = if (root.get("pricing")) |v| try readPricing(a, v) else &.{},
+            .hash_keys = if (root.get("hash_keys")) |v| switch (v) {
+                .bool => |b| b,
+                else => return error.MalformedConfig,
+            } else false,
         };
     }
 };
+
+fn rejectUnknownKeys(root: std.json.ObjectMap) !void {
+    const known = [_][]const u8{ "providers", "ignore", "pricing", "hash_keys" };
+    for (root.keys()) |name| {
+        var ok = false;
+        for (known) |k| ok = ok or std.mem.eql(u8, name, k);
+        if (!ok) return error.MalformedConfig;
+    }
+}
+
+fn readProviders(a: std.mem.Allocator, v: std.json.Value) ![]const Provider {
+    const items = switch (v) {
+        .array => |arr| arr,
+        else => return error.MalformedConfig,
+    };
+    const out = try a.alloc(Provider, items.items.len);
+    for (items.items, 0..) |item, i| {
+        const o = switch (item) {
+            .object => |o| o,
+            else => return error.MalformedConfig,
+        };
+        out[i] = .{
+            .name = try a.dupe(u8, stringField(o, "name") orelse return error.MalformedConfig),
+            .base = try a.dupe(u8, stringField(o, "base") orelse return error.MalformedConfig),
+            .env = try a.dupe(u8, stringField(o, "env") orelse return error.MalformedConfig),
+        };
+    }
+    return out;
+}
+
+fn readIgnore(a: std.mem.Allocator, v: std.json.Value) ![]const []const u8 {
+    const items = switch (v) {
+        .array => |arr| arr,
+        else => return error.MalformedConfig,
+    };
+    const out = try a.alloc([]const u8, items.items.len);
+    for (items.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .string => |str| try a.dupe(u8, str),
+            else => return error.MalformedConfig,
+        };
+    }
+    return out;
+}
+
+fn readPricing(a: std.mem.Allocator, v: std.json.Value) ![]const Price {
+    const o = switch (v) {
+        .object => |obj| obj,
+        else => return error.MalformedConfig,
+    };
+    const out = try a.alloc(Price, o.count());
+    var it = o.iterator();
+    var i: usize = 0;
+    while (it.next()) |kv| : (i += 1) {
+        const spec = switch (kv.value_ptr.*) {
+            .object => |so| so,
+            else => return error.MalformedConfig,
+        };
+        out[i] = .{
+            .model = try a.dupe(u8, kv.key_ptr.*),
+            .input = floatField(spec, "input") orelse return error.MalformedConfig,
+            .output = floatField(spec, "output") orelse return error.MalformedConfig,
+        };
+    }
+    return out;
+}
 
 fn floatField(o: std.json.ObjectMap, name: []const u8) ?f64 {
     const v = o.get(name) orelse return null;

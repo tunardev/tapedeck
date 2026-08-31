@@ -1,6 +1,5 @@
 name: Release
 
-# Tags only. A release must be a deliberate act, never a side effect of a push.
 on:
   push:
     tags: ["v*"]
@@ -9,8 +8,6 @@ permissions:
   contents: write
 
 jobs:
-  # A tag can be pushed at any commit, including one that never passed CI.
-  # Nothing is published until the suite is green.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -35,8 +32,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          # Same pin as CI. A release built on a different compiler than the
-          # one the tests ran on is not the thing that was tested.
           version: 0.16.0
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix out
       - name: smoke test the native artifact

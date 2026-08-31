@@ -6,8 +6,6 @@ on:
   pull_request:
     branches: [master, main]
 
-# A new push to the same branch/PR makes the previous run's results moot;
-# cancel it instead of burning runner minutes on output no one will read.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,8 +17,6 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
-      # Report both platforms even when one fails; otherwise a Linux failure
-      # cancels macOS and hides whether it would have failed too.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -28,17 +24,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          # Pinned: zig has no stable release, and a minor bump reliably
-          # renames something in std. Raise this deliberately, never implicitly.
           version: 0.16.0
-      # The count is asserted, not just the exit code: a test step that stops
-      # running looks identical to a passing one.
       - name: test
         run: |
           zig build test --summary all 2>&1 | tee summary.txt
           grep -qE '[0-9]+/[0-9]+ tests passed' summary.txt
           grep -q '0 failed' summary.txt || ! grep -q 'failed' summary.txt
-      # Releases ship ReleaseSafe; the safety semantics differ from Debug.
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig fmt --check src build.zig tests
 
