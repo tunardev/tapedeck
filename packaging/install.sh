@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install tapedeck. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/tunardev/tapedeck/main/packaging/install.sh | sh
+#   curl -fsSL https://tapedeck.tunar.dev | sh
 set -eu
 
 REPO="tunardev/tapedeck"

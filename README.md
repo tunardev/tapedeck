@@ -8,13 +8,11 @@ instant, offline, and costs nothing.
 
 ```console
 $ tapedeck -- pytest
-  recording · 47 recorded · 0 replayed · 0 missed · 812443 tokens spent
+  recording      47 recorded    812,443 tokens spent
   47 passed in 4m12s
 
-$ git add .tapedeck && git commit -m 'test: add llm cassettes'
-
 $ tapedeck --strict -- pytest
-  replaying · 0 recorded · 47 replayed · 0 missed · 812443 tokens not spent
+  replaying      47 replayed    812,443 tokens saved
   47 passed in 1.8s
 ```
 
@@ -29,33 +27,44 @@ full agent test suite.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tunardev/tapedeck/main/packaging/install.sh | sh
+curl -fsSL https://tapedeck.tunar.dev | sh
 ```
+
 A single static binary, no runtime. Built in Zig with **zero dependencies** —
 everything it needs is in the standard library.
 
-## What you get
+## Before you commit a cassette
 
-**In CI** — deterministic, offline, $0, no key.
+**A cassette is a test fixture, not a sanitised log.** It contains the request
+that produced each response — your system prompt, whatever context your app
+pulled in, tool results — and the model's full reply. tapedeck strips
+credential *headers*, and nothing else.
 
-**While developing** — stop paying to re-run the same prompt twenty times while
-you debug the tool-call loop underneath it.
+Read one before you commit it:
 
-**When something breaks** — `tapedeck show` prints the whole conversation as the
-model actually saw it, every turn and every tool call. Today you get that by
-adding print statements.
+```sh
+tapedeck show default
+```
+
+If prompts must not enter your repository in plaintext, set `hash_keys` (below).
+Response bodies are always stored verbatim; that is what a recording is.
 
 ## Commands
 
 ```sh
-tapedeck -- <cmd>              # record on miss, replay on hit
-tapedeck --strict -- <cmd>     # replay only; a miss fails the run
-tapedeck --rerecord -- <cmd>   # refresh entries after a prompt change
-tapedeck --cassette api -- <cmd>   # one cassette per suite
-tapedeck ls                    # what is recorded, and what it cost
-tapedeck show api              # the exchanges on a cassette
-tapedeck key '{"model":"m"}'   # the match key for a request body
+tapedeck -- <cmd>                # record on miss, replay on hit
+tapedeck --strict -- <cmd>       # replay only; a miss fails the run
+tapedeck --rerecord -- <cmd>     # refresh every entry the run touches
+tapedeck --rerecord a1b2c3d4 -- <cmd>   # refresh one entry, replay the rest
+tapedeck --cassette api -- <cmd> # one cassette per suite
+tapedeck ls                      # what is recorded, and what it cost
+tapedeck show api                # the exchanges, with ids, models and tokens
+tapedeck key '{"model":"m"}'     # the match key for a request body
 ```
+
+A prompt changed and one recorded answer is stale? `tapedeck show` gives you its
+id, and `--rerecord <id>` re-buys that one call while the other forty-six
+replay.
 
 ## Configuration
 
@@ -68,7 +77,8 @@ out of the box.
     { "name": "local", "base": "http://127.0.0.1:11434", "env": "OPENAI_BASE_URL" }
   ],
   "ignore": ["metadata.request_id", "trace_id"],
-  "pricing": { "claude-opus-5": { "input": 15.0, "output": 75.0 } }
+  "pricing": { "claude-opus-4": { "input": 15.0, "output": 75.0 } },
+  "hash_keys": false
 }
 ```
 
@@ -80,11 +90,16 @@ guessed, because vendors disagree on the pattern.
 matching. Field paths rather than regex patterns: exact, and they cannot
 silently over-match and collapse two different calls into one.
 
-**`pricing`** is per million tokens.
+**`pricing`** is per million tokens, matched by longest prefix so
+`claude-opus-4` covers `claude-opus-4-20250514`. A `+` after a total means some
+entries had no configured price.
+
+**`hash_keys`** stores a hash of the request instead of the request. Matching is
+unaffected; you lose readable diffs and gain a cassette with no prompt in it.
 
 ```console
 $ tapedeck ls
-default              1 entries      1500 tokens       516 bytes  $0.0525
+default              2 entries       3,000 tokens  $0.1050
 ```
 
 Token counts come from the provider's own response, so they are always right.
@@ -95,10 +110,10 @@ stale silently, and a confidently wrong number is worse than none.
 
 **vcrpy, nock, VCR?** They record HTTP, and they are excellent at it. LLM
 traffic is streamed SSE, one logical call is six HTTP round-trips in a tool
-loop, and the matching has to survive a date injected into a system prompt.
-Also they are one library per language; tapedeck is one binary for all of them.
+loop, and matching has to survive a date injected into a system prompt. They are
+also one library per language; tapedeck is one binary for all of them.
 
-**LiteLLM?** It is a production gateway you adopt with a config file and Redis,
+**LiteLLM?** A production gateway you adopt with a config file and Redis,
 caching for cost. tapedeck makes git-committed fixtures with per-suite isolation
 and fail-on-unmatched. Different job.
 
@@ -118,10 +133,15 @@ entire tail:
 | 10% | 34.9% |
 
 A 5% miss rate is respectable for a REST cassette library and useless here.
-Matching is canonical JSON plus scrubbers for the things agents inject as a
-matter of course — the current date, tool-call ids, absolute paths that differ
-between a laptop and a CI runner — while never letting two different calls
-collide. A wrong replay is a green test that proves nothing, so a miss is always
+
+Matching is a length-prefixed encoding of the method, provider, path and
+canonicalised body, so no byte inside a value can be mistaken for structure.
+Scrubbers handle what agents inject as a matter of course — the current date,
+tool-call ids, home directories that differ between a laptop and a CI runner —
+while staying narrow enough that `main.zig` and `build.zig` remain distinct
+requests, and `gpt-4o-2024-08-06` stays distinct from `gpt-4o-2024-11-20`.
+
+A wrong replay is a green test that proves nothing, so a miss is always
 preferred to a guess. See `src/matching.zig`.
 
 ## Status
@@ -135,13 +155,13 @@ SSE pacing.
 ## Building
 
 ```sh
-zig build test --summary all   # 74 tests
-zig build                      # zig-out/bin/tapedeck
+zig build test --summary all
+zig build
 ```
 
-Requires Zig 0.16.0 exactly — the version is pinned in `.zigversion` and in CI,
-because Zig has no stable release and a minor bump reliably renames something in
-`std`.
+Requires Zig 0.16.0 exactly — pinned in `.zigversion` and in CI, because Zig has
+no stable release and a minor bump reliably renames something in `std`. The test
+suite needs `python3` and `curl` for its end-to-end cases.
 
 ## License
 
