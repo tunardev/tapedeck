@@ -1,0 +1,54 @@
+name: Release
+
+# Tags only. A release must be a deliberate act, never a side effect of a push.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-macos
+          - aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          # Same pin as CI. A release built on a different compiler than the
+          # one the tests ran on is not the thing that was tested.
+          version: 0.16.0
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix out
+      - name: package
+        run: |
+          tar -C out/bin -czf tapedeck-${{ matrix.target }}.tar.gz tapedeck
+          sha256sum tapedeck-${{ matrix.target }}.tar.gz > tapedeck-${{ matrix.target }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tapedeck-${{ matrix.target }}
+          path: tapedeck-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: collect checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS && rm dist/*.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

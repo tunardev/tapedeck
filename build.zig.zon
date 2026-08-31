@@ -12,5 +12,6 @@
         "README.md",
         "tests",
         "scripts",
+        "packaging",
     },
 }
