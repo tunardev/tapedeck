@@ -106,7 +106,9 @@ pub const Cassette = struct {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
-            const e = try parseLine(gpa, line);
+            // One stable error for a corrupt file, rather than whichever
+            // internal name std.json happened to raise.
+            const e = parseLine(gpa, line) catch return error.CorruptCassette;
             try c.entries.put(gpa, e.key, e);
         }
         return c;
