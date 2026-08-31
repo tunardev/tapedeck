@@ -2,13 +2,35 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 
-const fake_port = 38897;
 const sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":45}}\n\n";
 
 fn hitCount(io: Io, gpa: std.mem.Allocator, path: []const u8) !usize {
     const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64)) catch return 0;
     defer gpa.free(text);
     return std.fmt.parseInt(usize, std.mem.trim(u8, text, " \n"), 10) catch 0;
+}
+
+fn readPort(io: Io, gpa: std.mem.Allocator, path: []const u8) !u16 {
+    const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16)) catch return error.NotReady;
+    defer gpa.free(text);
+    const trimmed = std.mem.trim(u8, text, " \n\r");
+    if (trimmed.len == 0) return error.NotReady;
+    return std.fmt.parseInt(u16, trimmed, 10) catch error.NotReady;
+}
+
+fn awaitStub(io: Io, gpa: std.mem.Allocator, port_file: []const u8) !u16 {
+    var waited: usize = 0;
+    while (waited < 100) : (waited += 1) {
+        if (readPort(io, gpa, port_file)) |port| {
+            const addr: Io.net.IpAddress = try .parseIp4("127.0.0.1", port);
+            if (addr.connect(io, .{ .mode = .stream })) |sock| {
+                sock.close(io);
+                return port;
+            } else |_| {}
+        } else |_| {}
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    return error.StubNeverStarted;
 }
 
 const fake_py =
@@ -26,7 +48,9 @@ const fake_py =
     \\        self.end_headers()
     \\        self.wfile.write(b)
     \\    def log_message(self, *a): pass
-    \\http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+    \\srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    \\open(os.environ["PORTFILE"], "w").write(str(srv.server_address[1]))
+    \\srv.serve_forever()
 ;
 
 test "record then replay through the installed binary" {
@@ -57,27 +81,19 @@ test "record then replay through the installed binary" {
     try env.put("HITFILE", hitfile);
     try env.put("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
 
-    var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{fake_port});
+    const port_file = work ++ "/port.txt";
+    try env.put("PORTFILE", port_file);
     var fake = try std.process.spawn(io, .{
-        .argv = &.{ "python3", py_path, port_str },
+        .argv = &.{ "python3", py_path },
         .environ_map = &env,
         .stdout = .ignore,
         .stderr = .ignore,
     });
     defer fake.kill(io);
 
-    var waited: usize = 0;
-    while (waited < 50) : (waited += 1) {
-        const addr: Io.net.IpAddress = try .parseIp4("127.0.0.1", fake_port);
-        if (addr.connect(io, .{ .mode = .stream })) |s| {
-            s.close(io);
-            break;
-        } else |_| {}
-        io.sleep(.fromMilliseconds(100), .awake) catch {};
-    }
+    const port = try awaitStub(io, gpa, port_file);
 
-    const upstream = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake_port});
+    const upstream = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
     defer gpa.free(upstream);
     try env.put("TAPEDECK_HOME", work ++ "/.tapedeck");
     try env.put("TAPEDECK_ANTHROPIC_UPSTREAM", upstream);
@@ -238,32 +254,23 @@ test "a user declared provider works end to end" {
         try w.interface.flush();
     }
 
-    const port = 38896;
     const hitfile = work ++ "/hits.txt";
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     try env.put("HITFILE", hitfile);
     try env.put("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
 
-    var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_file = work ++ "/port.txt";
+    try env.put("PORTFILE", port_file);
     var fake = try std.process.spawn(io, .{
-        .argv = &.{ "python3", py_path, port_str },
+        .argv = &.{ "python3", py_path },
         .environ_map = &env,
         .stdout = .ignore,
         .stderr = .ignore,
     });
     defer fake.kill(io);
 
-    var waited: usize = 0;
-    while (waited < 50) : (waited += 1) {
-        const addr: Io.net.IpAddress = try .parseIp4("127.0.0.1", port);
-        if (addr.connect(io, .{ .mode = .stream })) |s| {
-            s.close(io);
-            break;
-        } else |_| {}
-        io.sleep(.fromMilliseconds(100), .awake) catch {};
-    }
+    const port = try awaitStub(io, gpa, port_file);
 
     const upstream = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
     defer gpa.free(upstream);
