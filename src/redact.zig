@@ -12,6 +12,8 @@ const secret_headers = [_][]const u8{
     "openai-organization",
     "openai-project",
     "cookie",
+    // responses carry credentials back under set-cookie, not cookie
+    "set-cookie",
 };
 
 /// Whether a header carries a credential. Comparison is case-insensitive
@@ -29,6 +31,11 @@ pub fn value(name: []const u8, original: []const u8) []const u8 {
 }
 
 const testing = std.testing;
+
+test "response credentials are secret too" {
+    try testing.expect(isSecret("Set-Cookie"));
+    try testing.expect(isSecret("set-cookie"));
+}
 
 test "api key headers are secret regardless of case" {
     try testing.expect(isSecret("X-Api-Key"));
