@@ -57,6 +57,9 @@ pub const Exchange = struct {
     status: u16,
     headers: []const Header,
     body: Body,
+    /// Recorded without a content-length. Absent in cassettes written before
+    /// this field existed, which load as false.
+    chunked: bool = false,
 
     pub fn deinit(e: Exchange, gpa: std.mem.Allocator) void {
         gpa.free(e.key);
@@ -179,7 +182,9 @@ fn writeLine(gpa: std.mem.Allocator, e: Exchange, out: *std.ArrayList(u8)) !void
         try writeJsonString(gpa, h.value, out);
         try out.append(gpa, '}');
     }
-    try out.appendSlice(gpa, "],\"encoding\":");
+    try out.appendSlice(gpa, "],\"chunked\":");
+    try out.appendSlice(gpa, if (e.chunked) "true" else "false");
+    try out.appendSlice(gpa, ",\"encoding\":");
     switch (e.body) {
         .text => |t| {
             try out.appendSlice(gpa, "\"text\",\"body\":");
@@ -238,7 +243,8 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Exchange {
     else
         .{ .base64 = try gpa.dupe(u8, payload) };
 
-    return .{ .key = key, .status = status, .headers = headers, .body = body };
+    const chunked = if (obj.get("chunked")) |v| v.bool else false;
+    return .{ .key = key, .status = status, .headers = headers, .body = body, .chunked = chunked };
 }
 
 const testing = std.testing;

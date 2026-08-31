@@ -22,6 +22,10 @@ pub const Response = struct {
     status: u16,
     headers: []Header,
     body: []u8,
+    /// The provider sent no content-length, i.e. it streamed. Replay has to
+    /// reproduce that framing or a client branching on "is this streamed"
+    /// sees a different shape than it saw while recording.
+    chunked: bool,
 
     pub fn deinit(r: Response, gpa: std.mem.Allocator) void {
         for (r.headers) |h| {
@@ -133,6 +137,7 @@ pub fn forward(
         .status = @intFromEnum(response.head.status),
         .headers = try out_headers.toOwnedSlice(gpa),
         .body = try body.toOwnedSlice(gpa),
+        .chunked = response.head.content_length == null,
     };
 }
 

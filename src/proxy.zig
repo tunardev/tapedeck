@@ -232,7 +232,7 @@ pub const Proxy = struct {
         if (p.lookup(entry_key)) |hit| {
             defer hit.deinit(gpa);
             p.bump(.replayed);
-            return p.respond(req, hit.status, hit.headers, hit.body);
+            return p.respond(req, hit.status, hit.headers, hit.body, hit.chunked);
         }
 
         if (p.mode == .strict) {
@@ -258,7 +258,7 @@ pub const Proxy = struct {
         for (got.headers, 0..) |h, i| {
             stored[i] = .{ .name = h.name, .value = redact.value(h.name, h.value) };
         }
-        return p.respond(req, got.status, stored, .{ .text = got.body });
+        return p.respond(req, got.status, stored, .{ .text = got.body }, got.chunked);
     }
 
     fn lookup(p: *Proxy, entry_key: []const u8) ?Exchange {
@@ -284,6 +284,7 @@ pub const Proxy = struct {
             .status = got.status,
             .headers = headers,
             .body = try cassette_mod.Body.fromBytes(gpa, got.body),
+            .chunked = got.chunked,
         };
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
@@ -313,6 +314,7 @@ pub const Proxy = struct {
         status: u16,
         headers: []const cassette_mod.Header,
         body: cassette_mod.Body,
+        chunked: bool,
     ) !void {
         const gpa = p.gpa;
         const bytes = try body.toBytes(gpa);
@@ -325,11 +327,24 @@ pub const Proxy = struct {
             try extra.append(gpa, .{ .name = h.name, .value = h.value });
         }
 
-        try req.respond(bytes, .{
-            .status = @enumFromInt(status),
-            .extra_headers = extra.items,
-            .keep_alive = false,
-        });
+        if (chunked) {
+            var out_buf: [16 * 1024]u8 = undefined;
+            var w = try req.respondStreaming(&out_buf, .{
+                .respond_options = .{
+                    .status = @enumFromInt(status),
+                    .extra_headers = extra.items,
+                    .keep_alive = false,
+                },
+            });
+            try w.writer.writeAll(bytes);
+            try w.end();
+        } else {
+            try req.respond(bytes, .{
+                .status = @enumFromInt(status),
+                .extra_headers = extra.items,
+                .keep_alive = false,
+            });
+        }
     }
 };
 
@@ -365,6 +380,7 @@ fn cloneExchange(gpa: std.mem.Allocator, e: Exchange) !Exchange {
         .status = e.status,
         .headers = headers,
         .body = body,
+        .chunked = e.chunked,
     };
 }
 
@@ -405,6 +421,7 @@ const Fake = struct {
     payload: []const u8,
     status: u16,
     delay_ms: u64 = 0,
+    chunked: bool = false,
     inflight: std.atomic.Value(usize) = .init(0),
 
     fn start(io: Io, port_hint: u16, payload: []const u8, status: u16) !Fake {
@@ -457,14 +474,30 @@ const Fake = struct {
         }
         _ = f.hits.fetchAdd(1, .seq_cst);
         if (f.delay_ms > 0) f.io.sleep(.fromMilliseconds(@intCast(f.delay_ms)), .awake) catch {};
-        req.respond(f.payload, .{
-            .status = @enumFromInt(f.status),
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/event-stream" },
-                .{ .name = "set-cookie", .value = "session=leaked-credential" },
-            },
-            .keep_alive = false,
-        }) catch {};
+        const hdrs = [_]http.Header{
+            .{ .name = "content-type", .value = "text/event-stream" },
+            .{ .name = "set-cookie", .value = "session=leaked-credential" },
+        };
+        if (f.chunked) {
+            var body_buf: [8192]u8 = undefined;
+            if (req.respondStreaming(&body_buf, .{
+                .respond_options = .{
+                    .status = @enumFromInt(f.status),
+                    .extra_headers = &hdrs,
+                    .keep_alive = false,
+                },
+            })) |bw_val| {
+                var bw = bw_val;
+                bw.writer.writeAll(f.payload) catch {};
+                bw.end() catch {};
+            } else |_| {}
+        } else {
+            req.respond(f.payload, .{
+                .status = @enumFromInt(f.status),
+                .extra_headers = &hdrs,
+                .keep_alive = false,
+            }) catch {};
+        }
         writer.interface.flush() catch {};
     }
 
@@ -476,7 +509,7 @@ const Fake = struct {
     }
 };
 
-const CallResult = struct { status: u16, body: []u8 };
+const CallResult = struct { status: u16, body: []u8, chunked: bool };
 
 fn callProxy(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, body: []const u8) !CallResult {
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{ port, path });
@@ -514,7 +547,11 @@ fn callProxy(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, body: 
         if (n == 0) break;
         try out.appendSlice(gpa, chunk[0..n]);
     }
-    return .{ .status = @intFromEnum(resp.head.status), .body = try out.toOwnedSlice(gpa) };
+    return .{
+        .status = @intFromEnum(resp.head.status),
+        .body = try out.toOwnedSlice(gpa),
+        .chunked = resp.head.content_length == null,
+    };
 }
 
 test "records on first call and replays without touching upstream" {
@@ -728,4 +765,111 @@ test "concurrent requests are not serialised behind each other" {
     // Serial handling costs n*300ms; concurrent costs roughly one delay. The
     // midpoint leaves generous headroom for a loaded CI runner.
     try testing.expect(elapsed_ms < 800);
+}
+
+test "error status and body round trip exactly" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const envelope =
+        \\{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}
+    ;
+    var fake = try Fake.start(io, 39960, envelope, 429);
+    const fake_thread = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+    defer fake_thread.join();
+    defer fake.stop();
+
+    const dir = ".tapedeck-proxy-err";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const path = dir ++ "/cassettes/default.jsonl";
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+    defer gpa.free(base);
+    const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+    const body =
+        \\{"model":"m","messages":[]}
+    ;
+
+    {
+        var p = try Proxy.bind(gpa, io, path, .record, &ups, 39970);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        // A 429 is data a suite may assert on, not a transport failure.
+        try testing.expectEqual(@as(u16, 429), got.status);
+        try testing.expectEqualStrings(envelope, got.body);
+        try p.flush();
+        p.shutdown();
+        th.join();
+    }
+    {
+        var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39980);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try testing.expectEqual(@as(u16, 429), got.status);
+        try testing.expectEqualStrings(envelope, got.body);
+        try testing.expectEqual(@as(usize, 1), fake.hits.load(.seq_cst));
+        p.shutdown();
+        th.join();
+    }
+}
+
+test "a streamed response replays as streamed" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const sse = "event: a\ndata: {\"t\":1}\n\n";
+    var fake = try Fake.start(io, 39810, sse, 200);
+    fake.chunked = true;
+    const fake_thread = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+    defer fake_thread.join();
+    defer fake.stop();
+
+    const dir = ".tapedeck-proxy-chunked";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const path = dir ++ "/cassettes/default.jsonl";
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+    defer gpa.free(base);
+    const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+    const body =
+        \\{"model":"m","messages":[]}
+    ;
+
+    {
+        var p = try Proxy.bind(gpa, io, path, .record, &ups, 39820);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try testing.expectEqualStrings(sse, got.body);
+        try testing.expect(got.chunked);
+        try p.flush();
+        p.shutdown();
+        th.join();
+    }
+
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"chunked\":true") != null);
+
+    {
+        var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39830);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try testing.expectEqualStrings(sse, got.body);
+        // The replay must be framed the way the recording was.
+        try testing.expect(got.chunked);
+        p.shutdown();
+        th.join();
+    }
 }
