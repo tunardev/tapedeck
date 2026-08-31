@@ -45,6 +45,10 @@ pub const Upstream = struct {
     prefix: []const u8,
     /// Real API root, e.g. `https://api.anthropic.com`.
     base: []const u8,
+    /// Environment variable the provider's SDK reads. Configured rather than
+    /// derived, because vendors do not agree on the pattern — Gemini reads
+    /// `GOOGLE_GEMINI_BASE_URL`, not `GEMINI_BASE_URL`.
+    env: []const u8 = "",
 };
 
 pub const Proxy = struct {
@@ -54,6 +58,8 @@ pub const Proxy = struct {
     port: u16,
     mode: Mode,
     upstreams: []const Upstream,
+    /// Dotted JSON paths excluded from the match key, from config.
+    ignore: []const []const u8 = &.{},
     cassette: Cassette,
     mutex: Io.Mutex = .init,
     stats: Stats = .{},
@@ -106,10 +112,13 @@ pub const Proxy = struct {
         const out = try gpa.alloc([2][]const u8, p.upstreams.len);
         errdefer gpa.free(out);
         for (p.upstreams, 0..) |u, i| {
-            const name = try std.ascii.allocUpperString(gpa, u.prefix);
-            defer gpa.free(name);
+            const env_name = if (u.env.len > 0) try gpa.dupe(u8, u.env) else blk: {
+                const upper = try std.ascii.allocUpperString(gpa, u.prefix);
+                defer gpa.free(upper);
+                break :blk try std.fmt.allocPrint(gpa, "{s}_BASE_URL", .{upper});
+            };
             out[i] = .{
-                try std.fmt.allocPrint(gpa, "{s}_BASE_URL", .{name}),
+                env_name,
                 try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/{s}", .{ p.port, u.prefix }),
             };
         }
@@ -235,7 +244,7 @@ pub const Proxy = struct {
             return fail(req, "unknown provider prefix");
         };
 
-        const entry_key = try matching.key(gpa, body.items, &matching.all_scrubbers);
+        const entry_key = try matching.key(gpa, body.items, &matching.all_scrubbers, p.ignore);
         defer gpa.free(entry_key);
 
         if (p.mode != .rerecord) {
@@ -685,6 +694,35 @@ test "unknown provider prefix is rejected" {
 
     p.shutdown();
     th.join();
+}
+
+test "a configured env name overrides the derived one" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const dir = ".tapedeck-proxy-envname";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const ups = [_]Upstream{.{
+        .prefix = "gemini",
+        .base = "https://generativelanguage.googleapis.com",
+        .env = "GOOGLE_GEMINI_BASE_URL",
+    }};
+    var p = try Proxy.bind(gpa, io, dir ++ "/cassettes/default.jsonl", .record, &ups, 39890);
+    defer p.deinit();
+
+    const vars = try p.baseUrls(gpa);
+    defer {
+        for (vars) |v| {
+            gpa.free(v[0]);
+            gpa.free(v[1]);
+        }
+        gpa.free(vars);
+    }
+    // Deriving GEMINI_BASE_URL from the prefix would be wrong.
+    try testing.expectEqualStrings("GOOGLE_GEMINI_BASE_URL", vars[0][0]);
 }
 
 test "base urls carry the provider prefix" {

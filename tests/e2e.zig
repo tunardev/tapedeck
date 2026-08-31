@@ -204,3 +204,102 @@ test "ls and show read a cassette written to disk" {
     try std.testing.expect(std.mem.indexOf(u8, shown, "(streamed)") != null);
     try std.testing.expect(std.mem.indexOf(u8, shown, "slow down") != null);
 }
+
+test "a user declared provider works end to end" {
+    const gpa = std.testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const cwd = Io.Dir.cwd();
+
+    const work = ".tapedeck-e2e-provider";
+    cwd.deleteTree(io, work) catch {};
+    try cwd.createDirPath(io, work);
+    defer cwd.deleteTree(io, work) catch {};
+
+    const py_path = work ++ "/fake.py";
+    {
+        const f = try cwd.createFile(io, py_path, .{ .truncate = true });
+        defer f.close(io);
+        var buf: [4096]u8 = undefined;
+        var w = f.writer(io, &buf);
+        try w.interface.writeAll(fake_py);
+        try w.interface.flush();
+    }
+
+    // A provider tapedeck has never heard of, reading a non-derivable env var.
+    const home = work ++ "/.tapedeck";
+    try cwd.createDirPath(io, home);
+    {
+        const f = try cwd.createFile(io, home ++ "/config.json", .{ .truncate = true });
+        defer f.close(io);
+        var buf: [1024]u8 = undefined;
+        var w = f.writer(io, &buf);
+        try w.interface.writeAll(
+            \\{"providers":[{"name":"local","base":"http://unused","env":"MY_LLM_URL"}],
+            \\ "ignore":["metadata.request_id"]}
+        );
+        try w.interface.flush();
+    }
+
+    const port = 38896;
+    const hitfile = work ++ "/hits.txt";
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("HITFILE", hitfile);
+    try env.put("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
+
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var fake = try std.process.spawn(io, .{
+        .argv = &.{ "python3", py_path, port_str },
+        .environ_map = &env,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer fake.kill(io);
+
+    var waited: usize = 0;
+    while (waited < 50) : (waited += 1) {
+        const addr: Io.net.IpAddress = try .parseIp4("127.0.0.1", port);
+        if (addr.connect(io, .{ .mode = .stream })) |s| {
+            s.close(io);
+            break;
+        } else |_| {}
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+
+    const upstream = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
+    defer gpa.free(upstream);
+    try env.put("TAPEDECK_HOME", home);
+    try env.put("TAPEDECK_LOCAL_UPSTREAM", upstream);
+    try env.put("OUT", work ++ "/out.txt");
+
+    // The client reads MY_LLM_URL, which only the config knows about.
+    const client =
+        \\curl -sS -X POST "$MY_LLM_URL/v1/chat" -H 'content-type: application/json' \
+        \\ -d "$PAYLOAD" -o "$OUT"
+    ;
+    try env.put("PAYLOAD", "{\"model\":\"m\",\"metadata\":{\"request_id\":\"first\"}}");
+    var rec = try std.process.spawn(io, .{
+        .argv = &.{ build_options.exe_path, "--", "sh", "-c", client },
+        .environ_map = &env,
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rec.wait(io));
+    try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
+
+    // Only the ignored field differs, so strict replay must still hit.
+    try env.put("PAYLOAD", "{\"model\":\"m\",\"metadata\":{\"request_id\":\"second\"}}");
+    var rep = try std.process.spawn(io, .{
+        .argv = &.{ build_options.exe_path, "--strict", "--", "sh", "-c", client },
+        .environ_map = &env,
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rep.wait(io));
+    try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
+
+    // The hit count alone cannot tell a replay from a strict miss — a miss
+    // also leaves the provider untouched. Assert on what came back.
+    const replayed = try cwd.readFileAlloc(io, work ++ "/out.txt", gpa, .limited(1 << 16));
+    defer gpa.free(replayed);
+    try std.testing.expectEqualStrings(sse, replayed);
+}

@@ -7,6 +7,7 @@ const matching = tapedeck.matching;
 const proxy_mod = tapedeck.proxy;
 const runner = tapedeck.runner;
 const paths_mod = tapedeck.paths;
+const config_mod = tapedeck.config;
 const Paths = paths_mod.Paths;
 
 const usage =
@@ -26,15 +27,6 @@ const usage =
     \\  --cassette <name>   cassette to use (default: $TAPEDECK_CASSETTE or "default")
     \\
 ;
-
-/// Providers tapedeck fronts, and the environment variable each SDK reads.
-///
-/// The upstream is overridable so tests can point at a local fake without a
-/// network or a key.
-const providers = [_]struct { prefix: []const u8, override: []const u8, default: []const u8 }{
-    .{ .prefix = "anthropic", .override = "TAPEDECK_ANTHROPIC_UPSTREAM", .default = "https://api.anthropic.com" },
-    .{ .prefix = "openai", .override = "TAPEDECK_OPENAI_UPSTREAM", .default = "https://api.openai.com" },
-};
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -76,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "key")) {
             i += 1;
             if (i >= argv.items.len) return fail(io, "key needs a request body");
-            const k = try matching.key(gpa, argv.items[i], &matching.all_scrubbers);
+            const k = try matching.key(gpa, argv.items[i], &matching.all_scrubbers, &.{});
             defer gpa.free(k);
             return printLine(io, k);
         } else if (std.mem.eql(u8, a, "ls")) {
@@ -119,17 +111,36 @@ fn wrap(
     const path = try cassettePath(gpa, env, io, name);
     defer gpa.free(path);
 
+    const home = try Paths.resolve(gpa, env);
+    defer home.deinit(gpa);
+    var cfg = config_mod.Config.load(gpa, io, home.root) catch |e| switch (e) {
+        error.MalformedConfig => return fail(io, "config.json is not valid tapedeck config"),
+        else => return e,
+    };
+    defer cfg.deinit();
+
     var upstreams: std.ArrayList(proxy_mod.Upstream) = .empty;
     defer {
         for (upstreams.items) |u| gpa.free(u.base);
         upstreams.deinit(gpa);
     }
-    for (providers) |prov| {
-        const base = env.get(prov.override) orelse prov.default;
-        try upstreams.append(gpa, .{ .prefix = prov.prefix, .base = try gpa.dupe(u8, base) });
+    for (cfg.providers) |prov| {
+        // Per-provider override so a test can point at a local stub with no
+        // network and no key.
+        const upper = try std.ascii.allocUpperString(gpa, prov.name);
+        defer gpa.free(upper);
+        const var_name = try std.fmt.allocPrint(gpa, "TAPEDECK_{s}_UPSTREAM", .{upper});
+        defer gpa.free(var_name);
+        const base = env.get(var_name) orelse prov.base;
+        try upstreams.append(gpa, .{
+            .prefix = prov.name,
+            .base = try gpa.dupe(u8, base),
+            .env = prov.env,
+        });
     }
 
     var proxy = try proxy_mod.Proxy.bind(gpa, io, path, mode, upstreams.items, 39000);
+    proxy.ignore = cfg.ignore;
     defer proxy.deinit();
 
     const injected = try proxy.baseUrls(gpa);

@@ -42,27 +42,56 @@ pub const all_scrubbers = [_]Scrubber{ .timestamp, .uuid, .abs_path };
 ///
 /// A body that is not JSON falls back to its own bytes, so it still matches
 /// itself exactly rather than silently colliding with everything else.
-pub fn key(gpa: std.mem.Allocator, body: []const u8, scrubbers: []const Scrubber) ![]u8 {
-    const canonical = canonicalize(gpa, body) catch try gpa.dupe(u8, body);
+pub fn key(
+    gpa: std.mem.Allocator,
+    body: []const u8,
+    scrubbers: []const Scrubber,
+    /// Dotted JSON paths dropped before the key is formed, e.g.
+    /// `metadata.request_id`. Field-level and exact, unlike a pattern, which
+    /// can silently over-match and collapse two different calls into one.
+    ignore: []const []const u8,
+) ![]u8 {
+    const canonical = canonicalize(gpa, body, ignore) catch try gpa.dupe(u8, body);
     defer gpa.free(canonical);
     return scrub(gpa, canonical, scrubbers);
 }
 
-fn canonicalize(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+fn canonicalize(gpa: std.mem.Allocator, body: []const u8, ignore: []const []const u8) ![]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try writeCanonical(gpa, parsed.value, &out);
+    try writeCanonical(gpa, parsed.value, &out, "", ignore);
     return out.toOwnedSlice(gpa);
+}
+
+/// Whether `prefix` + `name` names an ignored path.
+fn isIgnored(prefix: []const u8, name: []const u8, ignore: []const []const u8) bool {
+    for (ignore) |path| {
+        if (prefix.len == 0) {
+            if (std.mem.eql(u8, path, name)) return true;
+            continue;
+        }
+        if (path.len != prefix.len + 1 + name.len) continue;
+        if (!std.mem.startsWith(u8, path, prefix)) continue;
+        if (path[prefix.len] != '.') continue;
+        if (std.mem.eql(u8, path[prefix.len + 1 ..], name)) return true;
+    }
+    return false;
 }
 
 /// Order-independent rendering of a JSON value.
 ///
 /// `std.json` preserves document order, so sorting here is what makes the key
 /// stable rather than a no-op the parser happens to supply.
-fn writeCanonical(gpa: std.mem.Allocator, v: std.json.Value, out: *std.ArrayList(u8)) !void {
+fn writeCanonical(
+    gpa: std.mem.Allocator,
+    v: std.json.Value,
+    out: *std.ArrayList(u8),
+    prefix: []const u8,
+    ignore: []const []const u8,
+) !void {
     switch (v) {
         .object => |obj| {
             const keys = try gpa.alloc([]const u8, obj.count());
@@ -72,9 +101,15 @@ fn writeCanonical(gpa: std.mem.Allocator, v: std.json.Value, out: *std.ArrayList
 
             try out.append(gpa, '{');
             for (keys) |k| {
+                if (isIgnored(prefix, k, ignore)) continue;
+                const child = if (prefix.len == 0)
+                    try gpa.dupe(u8, k)
+                else
+                    try std.fmt.allocPrint(gpa, "{s}.{s}", .{ prefix, k });
+                defer gpa.free(child);
                 try out.appendSlice(gpa, k);
                 try out.append(gpa, ':');
-                try writeCanonical(gpa, obj.get(k).?, out);
+                try writeCanonical(gpa, obj.get(k).?, out, child, ignore);
                 try out.append(gpa, ',');
             }
             try out.append(gpa, '}');
@@ -82,7 +117,7 @@ fn writeCanonical(gpa: std.mem.Allocator, v: std.json.Value, out: *std.ArrayList
         .array => |items| {
             try out.append(gpa, '[');
             for (items.items) |item| {
-                try writeCanonical(gpa, item, out);
+                try writeCanonical(gpa, item, out, prefix, ignore);
                 try out.append(gpa, ',');
             }
             try out.append(gpa, ']');
@@ -193,17 +228,17 @@ fn matchAbsPath(t: []const u8) ?usize {
 const testing = std.testing;
 
 fn expectSame(a: []const u8, b: []const u8) !void {
-    const ka = try key(testing.allocator, a, &all_scrubbers);
+    const ka = try key(testing.allocator, a, &all_scrubbers, &.{});
     defer testing.allocator.free(ka);
-    const kb = try key(testing.allocator, b, &all_scrubbers);
+    const kb = try key(testing.allocator, b, &all_scrubbers, &.{});
     defer testing.allocator.free(kb);
     try testing.expectEqualStrings(ka, kb);
 }
 
 fn expectDiffers(a: []const u8, b: []const u8) !void {
-    const ka = try key(testing.allocator, a, &all_scrubbers);
+    const ka = try key(testing.allocator, a, &all_scrubbers, &.{});
     defer testing.allocator.free(ka);
-    const kb = try key(testing.allocator, b, &all_scrubbers);
+    const kb = try key(testing.allocator, b, &all_scrubbers, &.{});
     defer testing.allocator.free(kb);
     try testing.expect(!std.mem.eql(u8, ka, kb));
 }
@@ -307,11 +342,11 @@ test "scrubbing keeps surrounding text distinct" {
 test "scrubbers can be disabled" {
     const a = try key(testing.allocator,
         \\{"system":"Today is 2026-08-31T14:22:03Z"}
-    , &.{});
+    , &.{}, &.{});
     defer testing.allocator.free(a);
     const b = try key(testing.allocator,
         \\{"system":"Today is 2026-09-01T09:03:41Z"}
-    , &.{});
+    , &.{}, &.{});
     defer testing.allocator.free(b);
     try testing.expect(!std.mem.eql(u8, a, b));
 }
@@ -327,4 +362,58 @@ test "large integers keep full precision" {
     ,
         \\{"n":9007199254740992}
     );
+}
+
+fn keyIgnoring(body: []const u8, ignore: []const []const u8) ![]u8 {
+    return key(testing.allocator, body, &all_scrubbers, ignore);
+}
+
+test "an ignored field stops affecting the key" {
+    const a =
+        \\{"model":"m","metadata":{"request_id":"abc"}}
+    ;
+    const b =
+        \\{"model":"m","metadata":{"request_id":"xyz"}}
+    ;
+    const with = [_][]const u8{"metadata.request_id"};
+
+    const ka = try keyIgnoring(a, &with);
+    defer testing.allocator.free(ka);
+    const kb = try keyIgnoring(b, &with);
+    defer testing.allocator.free(kb);
+    try testing.expectEqualStrings(ka, kb);
+
+    const na = try keyIgnoring(a, &.{});
+    defer testing.allocator.free(na);
+    const nb = try keyIgnoring(b, &.{});
+    defer testing.allocator.free(nb);
+    try testing.expect(!std.mem.eql(u8, na, nb));
+}
+
+test "a nested ignore path does not drop a top level field of the same name" {
+    const a =
+        \\{"b":"top","a":{"b":"nested"}}
+    ;
+    const b =
+        \\{"b":"CHANGED","a":{"b":"nested"}}
+    ;
+    const ignore = [_][]const u8{"a.b"};
+    const ka = try keyIgnoring(a, &ignore);
+    defer testing.allocator.free(ka);
+    const kb = try keyIgnoring(b, &ignore);
+    defer testing.allocator.free(kb);
+    // Only `a.b` is ignored, so the top-level `b` must still separate these.
+    try testing.expect(!std.mem.eql(u8, ka, kb));
+}
+
+test "ignoring a path that does not exist is harmless" {
+    const body =
+        \\{"model":"m"}
+    ;
+    const ignore = [_][]const u8{"nope.not.here"};
+    const k1 = try keyIgnoring(body, &ignore);
+    defer testing.allocator.free(k1);
+    const k2 = try keyIgnoring(body, &.{});
+    defer testing.allocator.free(k2);
+    try testing.expectEqualStrings(k1, k2);
 }

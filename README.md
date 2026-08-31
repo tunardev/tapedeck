@@ -30,6 +30,28 @@ $ tapedeck show api                              # what the model saw and return
 $ tapedeck --rerecord -- pytest                  # refresh after a prompt change
 ```
 
+## Configuration
+
+Optional `.tapedeck/config.json`. Without it, Anthropic, OpenAI and Gemini
+work out of the box.
+
+```json
+{
+  "providers": [
+    { "name": "local", "base": "http://127.0.0.1:11434", "env": "OPENAI_BASE_URL" }
+  ],
+  "ignore": ["metadata.request_id", "trace_id"]
+}
+```
+
+`providers` fronts anything with an HTTP API — Ollama, vLLM, OpenRouter, a
+gateway of your own. `env` is the variable your SDK reads, declared rather than
+guessed, because vendors disagree on the pattern.
+
+`ignore` names JSON fields that change every run and should not affect matching.
+Field paths rather than patterns: exact, and they cannot silently over-match and
+collapse two different calls into one.
+
 ## Why not a general HTTP cassette library
 
 Agent loops compound. Turn N+1's request embeds turn N's response, so one
