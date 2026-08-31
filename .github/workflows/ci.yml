@@ -21,8 +21,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
       - name: test
@@ -44,8 +44,8 @@ jobs:
           - x86_64-macos
           - aarch64-macos
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
