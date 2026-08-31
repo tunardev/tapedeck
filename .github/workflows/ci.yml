@@ -28,8 +28,8 @@ jobs:
       - name: test
         run: |
           zig build test --summary all 2>&1 | tee summary.txt
-          grep -qE '[0-9]+/[0-9]+ tests passed' summary.txt
-          grep -q '0 failed' summary.txt || ! grep -q 'failed' summary.txt
+          grep -qE 'Build Summary: [0-9]+/[0-9]+ steps succeeded; [0-9]+/[0-9]+ tests passed[[:space:]]*$' summary.txt
+          test "$(grep -cE 'run test [0-9]+ pass' summary.txt)" -eq 5
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig fmt --check src build.zig tests
 
