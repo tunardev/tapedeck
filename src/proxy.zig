@@ -69,6 +69,11 @@ pub const Proxy = struct {
     upstreams: []const Upstream,
     /// Dotted JSON paths excluded from the match key, from config.
     ignore: []const []const u8 = &.{},
+    /// Store a hash of the request rather than the request itself.
+    hash_keys: bool = false,
+    /// When set, `rerecord` refreshes only the entry with this short id and
+    /// replays everything else, so fixing one call costs one call.
+    rerecord_id: ?[]const u8 = null,
     cassette: Cassette,
     mutex: Io.Mutex = .init,
     stats: Stats = .{},
@@ -277,14 +282,20 @@ pub const Proxy = struct {
 
         // The body alone is not an identity: two bodyless POSTs to different
         // paths would otherwise share one cassette entry.
-        const entry_key = try matching.key(gpa, .{
+        const canonical = try matching.key(gpa, .{
             .method = @tagName(method),
             .provider = split.prefix,
             .path = split.rest,
         }, body.items, .{ .ignore = p.ignore });
+        defer gpa.free(canonical);
+
+        const entry_key = if (p.hash_keys)
+            try cassette_mod.hashKey(gpa, canonical)
+        else
+            try gpa.dupe(u8, canonical);
         defer gpa.free(entry_key);
 
-        if (p.mode != .rerecord) {
+        if (!p.shouldRefresh(entry_key)) {
             if (p.lookup(entry_key)) |hit| {
                 defer hit.deinit(gpa);
                 p.bump(.replayed);
@@ -322,6 +333,13 @@ pub const Proxy = struct {
             stored[i] = .{ .name = h.name, .value = redact.value(h.name, h.value) };
         }
         return p.respond(req, got.status, stored, .{ .text = got.body }, got.chunked);
+    }
+
+    /// Whether this key must go upstream regardless of what is on the cassette.
+    fn shouldRefresh(p: *const Proxy, entry_key: []const u8) bool {
+        if (p.mode != .rerecord) return false;
+        const want = p.rerecord_id orelse return true;
+        return std.mem.eql(u8, &cassette_mod.shortId(entry_key), want);
     }
 
     fn lookup(p: *Proxy, entry_key: []const u8) ?Exchange {
@@ -1063,4 +1081,117 @@ test "rerecord refreshes an entry instead of replaying it" {
         p.shutdown();
         th.join();
     }
+}
+
+test "hash_keys keeps the prompt out of the cassette" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    var fake = try Fake.start(io, 39710, "data: ok\n\n", 200);
+    const ft = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+    defer ft.join();
+    defer fake.stop();
+
+    const dir = ".tapedeck-proxy-hashed";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const path = dir ++ "/cassettes/default.jsonl";
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+    defer gpa.free(base);
+    const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+    const body =
+        \\{"messages":[{"role":"user","content":"PROPRIETARY PROMPT TEXT"}]}
+    ;
+
+    {
+        var p = try Proxy.bind(gpa, io, path, .record, &ups, 39720);
+        p.hash_keys = true;
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+        defer gpa.free(got.body);
+        try p.flush();
+        p.shutdown();
+        th.join();
+    }
+
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "PROPRIETARY PROMPT TEXT") == null);
+
+    // Replay must still hit, or the privacy option would cost correctness.
+    var p = try Proxy.bind(gpa, io, path, .strict, &ups, 39730);
+    p.hash_keys = true;
+    defer p.deinit();
+    const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+    const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", body);
+    defer gpa.free(got.body);
+    try testing.expectEqualStrings("data: ok\n\n", got.body);
+    p.shutdown();
+    th.join();
+    try testing.expectEqual(@as(usize, 1), p.snapshot().replayed);
+}
+
+test "a rerecord selector refreshes one entry and replays the rest" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const dir = ".tapedeck-proxy-select";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const path = dir ++ "/cassettes/default.jsonl";
+    const first =
+        \\{"model":"m","n":1}
+    ;
+    const second =
+        \\{"model":"m","n":2}
+    ;
+
+    var fake = try Fake.start(io, 39740, "data: ok\n\n", 200);
+    const ft = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+    defer ft.join();
+    defer fake.stop();
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+    defer gpa.free(base);
+    const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+
+    {
+        var p = try Proxy.bind(gpa, io, path, .record, &ups, 39750);
+        defer p.deinit();
+        const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+        for ([_][]const u8{ first, second }) |b| {
+            const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", b);
+            gpa.free(got.body);
+        }
+        try p.flush();
+        p.shutdown();
+        th.join();
+    }
+
+    // Take the id of the first entry only.
+    var loaded = try Cassette.load(gpa, io, path);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 2), loaded.count());
+    const target = cassette_mod.shortId(loaded.values()[0].key);
+
+    const before = fake.hits.load(.seq_cst);
+    var p = try Proxy.bind(gpa, io, path, .rerecord, &ups, 39760);
+    p.rerecord_id = &target;
+    defer p.deinit();
+    const th = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+    for ([_][]const u8{ first, second }) |b| {
+        const got = try callProxy(gpa, io, p.port, "/anthropic/v1/messages", b);
+        gpa.free(got.body);
+    }
+    p.shutdown();
+    th.join();
+
+    const stats = p.snapshot();
+    // The whole point: fixing one call costs one call, not the whole suite.
+    try testing.expectEqual(@as(usize, 1), stats.recorded);
+    try testing.expectEqual(@as(usize, 1), stats.replayed);
+    try testing.expectEqual(@as(usize, 1), fake.hits.load(.seq_cst) - before);
 }

@@ -12,11 +12,11 @@ build: ## zig build
 test: ## zig build test --summary all
 	zig build test --summary all
 
-fmt: ## zig fmt src build.zig
-	zig fmt src build.zig
+fmt: ## zig fmt src build.zig tests
+	zig fmt src build.zig tests
 
-fmt-check: ## zig fmt --check src build.zig
-	zig fmt --check src build.zig
+fmt-check: ## zig fmt --check src build.zig tests
+	zig fmt --check src build.zig tests
 
 check: fmt-check test ## fmt-check then test
 
@@ -24,4 +24,4 @@ run: ## zig build run -- ARGS
 	zig build run -- $(ARGS)
 
 clean: ## remove build outputs
-	rm -rf zig-out .zig-cache
+	rm -rf zig-out .zig-cache .tapedeck-*

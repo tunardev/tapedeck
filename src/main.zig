@@ -3,12 +3,17 @@ const Io = std.Io;
 const tapedeck = @import("tapedeck");
 
 const cassette_mod = tapedeck.cassette;
+const config_mod = tapedeck.config;
 const matching = tapedeck.matching;
+const paths_mod = tapedeck.paths;
 const proxy_mod = tapedeck.proxy;
 const runner = tapedeck.runner;
-const paths_mod = tapedeck.paths;
-const config_mod = tapedeck.config;
 const Paths = paths_mod.Paths;
+
+/// Reserved for tapedeck's own failures, well clear of the 0-125 range a
+/// wrapped command is likely to use, so CI can tell the two apart.
+const exit_tapedeck_error: u8 = 120;
+const exit_usage: u8 = 121;
 
 const usage =
     \\tapedeck — record your LLM calls once, replay them free
@@ -23,12 +28,107 @@ const usage =
     \\
     \\options:
     \\  --strict            a request with no recorded entry is an error
-    \\  --rerecord          refresh every entry this run touches
+    \\  --rerecord [id]     refresh every entry the run touches, or just one
     \\  --cassette <name>   cassette to use (default: $TAPEDECK_CASSETTE or "default")
     \\
 ;
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |e| {
+        printErr(init.io, "tapedeck: ");
+        printErr(init.io, @errorName(e));
+        printErr(init.io, "\n");
+        std.process.exit(exit_tapedeck_error);
+    };
+}
+
+const Command = union(enum) {
+    wrap: []const []const u8,
+    ls,
+    show,
+    where,
+    key: []const u8,
+    version,
+    help,
+};
+
+const Invocation = struct {
+    command: Command,
+    mode: proxy_mod.Mode = .record,
+    rerecord_id: ?[]const u8 = null,
+    cassette: []const u8 = "default",
+};
+
+/// An option value that looks like a flag is a mistake, not a name.
+/// `tapedeck --cassette --strict -- pytest` used to record live against the
+/// real API under a cassette called "--strict".
+fn optionValue(args: []const []const u8, i: *usize, flag: []const u8) ?[]const u8 {
+    i.* += 1;
+    if (i.* >= args.len) return null;
+    const v = args[i.*];
+    if (v.len > 0 and v[0] == '-') return null;
+    _ = flag;
+    return v;
+}
+
+fn parse(args: []const []const u8, env_cassette: ?[]const u8) !Invocation {
+    var inv: Invocation = .{ .command = .help };
+    if (env_cassette) |name| {
+        // An empty variable in a CI matrix means unset, not "".
+        if (name.len > 0) inv.cassette = name;
+    }
+    var mode_set = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--")) {
+            inv.command = .{ .wrap = args[i + 1 ..] };
+            return inv;
+        } else if (std.mem.eql(u8, a, "--strict")) {
+            if (mode_set) return error.ConflictingModes;
+            inv.mode = .strict;
+            mode_set = true;
+        } else if (std.mem.eql(u8, a, "--rerecord")) {
+            if (mode_set) return error.ConflictingModes;
+            inv.mode = .rerecord;
+            mode_set = true;
+            // An optional selector: a bare `--rerecord` refreshes everything.
+            if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-' and
+                !std.mem.eql(u8, args[i + 1], "--"))
+            {
+                i += 1;
+                inv.rerecord_id = args[i];
+            }
+        } else if (std.mem.eql(u8, a, "--cassette")) {
+            inv.cassette = optionValue(args, &i, a) orelse return error.MissingOptionValue;
+        } else if (std.mem.eql(u8, a, "--version")) {
+            inv.command = .version;
+            return inv;
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            inv.command = .help;
+            return inv;
+        } else if (std.mem.eql(u8, a, "where")) {
+            inv.command = .where;
+            return inv;
+        } else if (std.mem.eql(u8, a, "ls")) {
+            inv.command = .ls;
+            return inv;
+        } else if (std.mem.eql(u8, a, "show")) {
+            if (optionValue(args, &i, a)) |name| inv.cassette = name;
+            inv.command = .show;
+            return inv;
+        } else if (std.mem.eql(u8, a, "key")) {
+            inv.command = .{ .key = optionValue(args, &i, a) orelse return error.MissingOptionValue };
+            return inv;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    return inv;
+}
+
+fn run(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const env = init.environ_map;
@@ -39,85 +139,72 @@ pub fn main(init: std.process.Init) !void {
     _ = it.next();
     while (it.next()) |a| try argv.append(gpa, a);
 
-    var mode: proxy_mod.Mode = .record;
-    var name: []const u8 = env.get("TAPEDECK_CASSETTE") orelse "default";
+    const inv = parse(argv.items, env.get("TAPEDECK_CASSETTE")) catch |e| {
+        printErr(io, switch (e) {
+            error.ConflictingModes => "tapedeck: --strict and --rerecord cannot be combined\n",
+            error.MissingOptionValue => "tapedeck: an option is missing its value\n",
+            else => usage,
+        });
+        std.process.exit(exit_usage);
+    };
 
-    var i: usize = 0;
-    while (i < argv.items.len) : (i += 1) {
-        const a = argv.items[i];
-        if (std.mem.eql(u8, a, "--")) {
-            return wrap(gpa, io, env, argv.items[i + 1 ..], mode, name);
-        } else if (std.mem.eql(u8, a, "--strict")) {
-            mode = .strict;
-        } else if (std.mem.eql(u8, a, "--rerecord")) {
-            mode = .rerecord;
-        } else if (std.mem.eql(u8, a, "--cassette")) {
-            i += 1;
-            if (i >= argv.items.len) return fail(io, "--cassette needs a name");
-            name = argv.items[i];
-        } else if (std.mem.eql(u8, a, "--version")) {
-            return printLine(io, "tapedeck 0.1.0");
-        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            return printLine(io, usage);
-        } else if (std.mem.eql(u8, a, "where")) {
-            const p = try Paths.resolve(gpa, env);
-            defer p.deinit(gpa);
-            const dir = try p.cassetteFile(gpa, "");
+    const home = try Paths.resolve(gpa, env);
+    defer home.deinit(gpa);
+    var cfg = config_mod.Config.load(gpa, io, home.root) catch |e| switch (e) {
+        error.MalformedConfig => {
+            printErr(io, "tapedeck: config.json is not valid tapedeck config\n");
+            std.process.exit(exit_tapedeck_error);
+        },
+        else => return e,
+    };
+    defer cfg.deinit();
+
+    switch (inv.command) {
+        .version => printLine(io, "tapedeck 0.1.0"),
+        .help => printLine(io, usage),
+        .where => {
+            const dir = try home.cassetteFile(gpa, "");
             defer gpa.free(dir);
-            return printLine(io, dir);
-        } else if (std.mem.eql(u8, a, "key")) {
-            i += 1;
-            if (i >= argv.items.len) return fail(io, "key needs a request body");
-            const k = try matching.key(gpa, .{}, argv.items[i], .{});
+            printLine(io, dir);
+        },
+        .key => |body| {
+            // The proxy applies `ignore`; a diagnostic that skipped it would
+            // print a key the proxy never uses.
+            const k = try matching.key(gpa, .{}, body, .{ .ignore = cfg.ignore });
             defer gpa.free(k);
-            return printLine(io, k);
-        } else if (std.mem.eql(u8, a, "ls")) {
-            return list(gpa, io, env);
-        } else if (std.mem.eql(u8, a, "show")) {
-            if (i + 1 < argv.items.len) name = argv.items[i + 1];
-            return show(gpa, io, env, name);
-        } else {
-            return fail(io, usage);
-        }
+            printLine(io, k);
+        },
+        .ls => try list(gpa, io, home, cfg),
+        .show => try show(gpa, io, home, inv.cassette),
+        .wrap => |command| try wrap(gpa, io, env, home, cfg, inv, command),
     }
-    return fail(io, usage);
 }
 
-fn cassettePath(
-    gpa: std.mem.Allocator,
-    env: *std.process.Environ.Map,
-    io: Io,
-    name: []const u8,
-) ![]u8 {
-    const safe = paths_mod.sanitizeName(name) orelse
-        fail(io, "cassette name must be a single path segment");
-    const p = try Paths.resolve(gpa, env);
-    defer p.deinit(gpa);
+fn cassettePath(gpa: std.mem.Allocator, home: Paths, name: []const u8) ![]u8 {
+    const safe = paths_mod.sanitizeName(name) orelse return error.UnsafeCassetteName;
     const file = try std.fmt.allocPrint(gpa, "{s}.jsonl", .{safe});
     defer gpa.free(file);
-    return p.cassetteFile(gpa, file);
+    return home.cassetteFile(gpa, file);
 }
 
 fn wrap(
     gpa: std.mem.Allocator,
     io: Io,
     env: *std.process.Environ.Map,
+    home: Paths,
+    cfg: config_mod.Config,
+    inv: Invocation,
     command: []const []const u8,
-    mode: proxy_mod.Mode,
-    name: []const u8,
 ) !void {
-    if (command.len == 0) return fail(io, "nothing to run; try `tapedeck -- pytest`");
+    if (command.len == 0) {
+        printErr(io, "tapedeck: nothing to run; try `tapedeck -- pytest`\n");
+        std.process.exit(exit_usage);
+    }
 
-    const path = try cassettePath(gpa, env, io, name);
+    const path = try cassettePath(gpa, home, inv.cassette);
     defer gpa.free(path);
 
-    const home = try Paths.resolve(gpa, env);
-    defer home.deinit(gpa);
-    var cfg = config_mod.Config.load(gpa, io, home.root) catch |e| switch (e) {
-        error.MalformedConfig => return fail(io, "config.json is not valid tapedeck config"),
-        else => return e,
-    };
-    defer cfg.deinit();
+    if (inv.rerecord_id) |id| try requireEntry(gpa, io, path, id);
 
     var upstreams: std.ArrayList(proxy_mod.Upstream) = .empty;
     defer {
@@ -125,22 +212,21 @@ fn wrap(
         upstreams.deinit(gpa);
     }
     for (cfg.providers) |prov| {
-        // Per-provider override so a test can point at a local stub with no
-        // network and no key.
         const upper = try std.ascii.allocUpperString(gpa, prov.name);
         defer gpa.free(upper);
         const var_name = try std.fmt.allocPrint(gpa, "TAPEDECK_{s}_UPSTREAM", .{upper});
         defer gpa.free(var_name);
-        const base = env.get(var_name) orelse prov.base;
         try upstreams.append(gpa, .{
             .prefix = prov.name,
-            .base = try gpa.dupe(u8, base),
+            .base = try gpa.dupe(u8, env.get(var_name) orelse prov.base),
             .env = prov.env,
         });
     }
 
-    var proxy = try proxy_mod.Proxy.bind(gpa, io, path, mode, upstreams.items, 39000);
+    var proxy = try proxy_mod.Proxy.bind(gpa, io, path, inv.mode, upstreams.items, 39000);
     proxy.ignore = cfg.ignore;
+    proxy.hash_keys = cfg.hash_keys;
+    proxy.rerecord_id = inv.rerecord_id;
     defer proxy.deinit();
 
     const injected = try proxy.baseUrls(gpa);
@@ -153,107 +239,152 @@ fn wrap(
     }
 
     const serving = try std.Thread.spawn(.{}, proxy_mod.Proxy.serve, .{&proxy});
-    const code = runner.run(io, command, env, injected) catch |e| {
-        proxy.shutdown();
-        serving.join();
-        return e;
-    };
+    const result = runner.run(io, command, env, injected);
+
+    // Shut down and flush on every path: an error here still leaves recordings
+    // that were already paid for, and losing them is the worst outcome.
     proxy.shutdown();
     serving.join();
-    try proxy.flush();
+    proxy.flush() catch |e| {
+        printErr(io, "tapedeck: could not write the cassette: ");
+        printErr(io, @errorName(e));
+        printErr(io, "\n");
+        std.process.exit(exit_tapedeck_error);
+    };
 
-    const stats = proxy.snapshot();
-    var buf: [320]u8 = undefined;
+    try report(gpa, io, inv.mode, proxy.snapshot());
+    std.process.exit(try result);
+}
+
+/// An unknown `--rerecord` selector is a typo, not a request to refresh nothing.
+fn requireEntry(gpa: std.mem.Allocator, io: Io, path: []const u8, id: []const u8) !void {
+    var c = try cassette_mod.Cassette.load(gpa, io, path);
+    defer c.deinit();
+    for (c.values()) |e| {
+        if (std.mem.eql(u8, &cassette_mod.shortId(e.key), id)) return;
+    }
+    printErr(io, "tapedeck: no cassette entry with id ");
+    printErr(io, id);
+    printErr(io, "\n");
+    std.process.exit(exit_usage);
+}
+
+fn report(gpa: std.mem.Allocator, io: Io, mode: proxy_mod.Mode, s: proxy_mod.Stats) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
     const verb = switch (mode) {
         .record => "recording",
         .strict => "replaying",
         .rerecord => "re-recording",
     };
-    const spent = stats.spent_input + stats.spent_output;
-    const saved = stats.saved_input + stats.saved_output;
-    const line = if (saved > 0 and spent == 0)
-        std.fmt.bufPrint(
-            &buf,
-            "  {s} · {d} recorded · {d} replayed · {d} missed · {d} tokens not spent\n",
-            .{ verb, stats.recorded, stats.replayed, stats.missed, saved },
-        ) catch "  done\n"
-    else
-        std.fmt.bufPrint(
-            &buf,
-            "  {s} · {d} recorded · {d} replayed · {d} missed · {d} tokens spent\n",
-            .{ verb, stats.recorded, stats.replayed, stats.missed, spent },
-        ) catch "  done\n";
-    printErr(io, line);
+    try out.print(gpa, "  {s: <12}", .{verb});
+    if (s.recorded > 0) try printField(gpa, &out, s.recorded, "recorded");
+    if (s.replayed > 0) try printField(gpa, &out, s.replayed, "replayed");
+    if (s.recorded == 0 and s.replayed == 0) try printField(gpa, &out, 0, "calls");
+    // Only shown when non-zero, so a clean run stays quiet and a broken one
+    // is the only thing that draws the eye.
+    if (s.missed > 0) try printField(gpa, &out, s.missed, "missed");
+    if (s.failed > 0) try printField(gpa, &out, s.failed, "failed");
 
-    std.process.exit(code);
+    const spent = s.spent_input + s.spent_output;
+    const saved = s.saved_input + s.saved_output;
+    if (spent > 0) {
+        try out.appendSlice(gpa, "  ");
+        try printGrouped(gpa, &out, spent);
+        try out.appendSlice(gpa, " tokens spent");
+    } else if (saved > 0) {
+        try out.appendSlice(gpa, "  ");
+        try printGrouped(gpa, &out, saved);
+        try out.appendSlice(gpa, " tokens saved");
+    }
+    try out.append(gpa, '\n');
+    printErr(io, out.items);
 }
 
-fn list(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map) !void {
-    const p = try Paths.resolve(gpa, env);
-    defer p.deinit(gpa);
-    const dir_path = try p.cassetteFile(gpa, "");
+fn printField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: usize, label: []const u8) !void {
+    var digits: std.ArrayList(u8) = .empty;
+    defer digits.deinit(gpa);
+    try printGrouped(gpa, &digits, n);
+    try out.print(gpa, "{s: >6} {s: <9}", .{ digits.items, label });
+}
+
+/// Thousands separators: `812443` is a number to decode, `812,443` is one to read.
+fn printGrouped(gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: u64) !void {
+    var buf: [24]u8 = undefined;
+    const digits = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+    for (digits, 0..) |c, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) try out.append(gpa, ',');
+        try out.append(gpa, c);
+    }
+}
+
+fn list(gpa: std.mem.Allocator, io: Io, home: Paths, cfg: config_mod.Config) !void {
+    const dir_path = try home.cassetteFile(gpa, "");
     defer gpa.free(dir_path);
 
-    var cfg = config_mod.Config.load(gpa, io, p.root) catch |e| switch (e) {
-        error.MalformedConfig => return fail(io, "config.json is not valid tapedeck config"),
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return printLine(io, "no cassettes recorded yet"),
         else => return e,
-    };
-    defer cfg.deinit();
-
-    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch {
-        return printLine(io, "no cassettes recorded yet");
     };
     defer dir.close(io);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
+    var found: usize = 0;
 
     var walker = dir.iterate();
-    var found: usize = 0;
     while (try walker.next(io)) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        found += 1;
+        const name = entry.name[0 .. entry.name.len - ".jsonl".len];
         const full = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
         defer gpa.free(full);
-        var c = cassette_mod.Cassette.load(gpa, io, full) catch continue;
+
+        var c = cassette_mod.Cassette.load(gpa, io, full) catch {
+            // Naming it is the point; hiding it would report the user's data
+            // as absent.
+            try out.print(gpa, "{s: <20}  unreadable\n", .{name});
+            continue;
+        };
         defer c.deinit();
-        const stat = dir.statFile(io, entry.name, .{}) catch null;
-        const bytes: u64 = if (stat) |st| st.size else 0;
-        const name = entry.name[0 .. entry.name.len - ".jsonl".len];
 
         var tokens: u64 = 0;
         var dollars: f64 = 0;
-        var priced = false;
+        var unpriced: usize = 0;
         for (c.values()) |e| {
             tokens += e.input_tokens + e.output_tokens;
-            // Priced per entry, because each one names its own model.
             if (cfg.cost(e.model, e.input_tokens, e.output_tokens)) |d| {
                 dollars += d;
-                priced = true;
+            } else if (e.input_tokens + e.output_tokens > 0) {
+                unpriced += 1;
             }
         }
 
-        var row: [512]u8 = undefined;
-        const text = if (priced)
-            try std.fmt.bufPrint(&row, "{s: <20} {d: >5} entries  {d: >9} tokens  {d: >8} bytes  ${d:.4}\n", .{
-                name, c.count(), tokens, bytes, dollars,
-            })
-        else
-            try std.fmt.bufPrint(&row, "{s: <20} {d: >5} entries  {d: >9} tokens  {d: >8} bytes\n", .{
-                name, c.count(), tokens, bytes,
-            });
-        try out.appendSlice(gpa, text);
-        found += 1;
+        try out.print(gpa, "{s: <20} {d: >5} entries ", .{ name, c.count() });
+        try out.print(gpa, "{d: >10} tokens", .{tokens});
+        if (dollars > 0) {
+            // Marked when some entries had no price, so a partial total is
+            // never mistaken for the whole cost.
+            try out.print(gpa, "  ${d:.4}{s}", .{ dollars, if (unpriced > 0) "+" else "" });
+        }
+        try out.append(gpa, '\n');
     }
+
     if (found == 0) return printLine(io, "no cassettes recorded yet");
     printRaw(io, out.items);
 }
 
-fn show(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, name: []const u8) !void {
-    const path = try cassettePath(gpa, env, io, name);
+fn show(gpa: std.mem.Allocator, io: Io, home: Paths, name: []const u8) !void {
+    const path = try cassettePath(gpa, home, name);
     defer gpa.free(path);
 
-    var c = cassette_mod.Cassette.load(gpa, io, path) catch {
-        return fail(io, "no such cassette");
+    var c = cassette_mod.Cassette.load(gpa, io, path) catch |e| switch (e) {
+        error.CorruptCassette => {
+            printErr(io, "tapedeck: cassette is corrupt\n");
+            std.process.exit(exit_tapedeck_error);
+        },
+        else => return e,
     };
     defer c.deinit();
 
@@ -262,15 +393,14 @@ fn show(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, name: []c
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     for (c.values()) |e| {
-        var head: [256]u8 = undefined;
-        try out.appendSlice(gpa, try std.fmt.bufPrint(&head, "status {d}{s}\n", .{
-            e.status,
-            if (e.chunked) " (streamed)" else "",
-        }));
-        for (e.headers) |h| {
-            var hb: [1024]u8 = undefined;
-            try out.appendSlice(gpa, try std.fmt.bufPrint(&hb, "  {s}: {s}\n", .{ h.name, h.value }));
+        try out.print(gpa, "{s}  status {d}", .{ cassette_mod.shortId(e.key), e.status });
+        if (e.chunked) try out.appendSlice(gpa, "  streamed");
+        if (e.model.len > 0) try out.print(gpa, "  {s}", .{e.model});
+        if (e.input_tokens + e.output_tokens > 0) {
+            try out.print(gpa, "  {d} in / {d} out", .{ e.input_tokens, e.output_tokens });
         }
+        try out.append(gpa, '\n');
+        for (e.headers) |h| try out.print(gpa, "  {s}: {s}\n", .{ h.name, h.value });
         const body = try e.body.toBytes(gpa);
         defer gpa.free(body);
         try out.appendSlice(gpa, body);
@@ -298,8 +428,62 @@ fn printErr(io: Io, text: []const u8) void {
     w.interface.flush() catch {};
 }
 
-fn fail(io: Io, message: []const u8) noreturn {
-    printErr(io, message);
-    if (message.len == 0 or message[message.len - 1] != '\n') printErr(io, "\n");
-    std.process.exit(2);
+const testing = std.testing;
+
+test "a flag is never taken as an option value" {
+    // `--cassette --strict` once recorded live under a cassette named "--strict".
+    try testing.expectError(error.MissingOptionValue, parse(&.{ "--cassette", "--strict", "--", "x" }, null));
+}
+
+test "conflicting mode flags are rejected" {
+    try testing.expectError(error.ConflictingModes, parse(&.{ "--strict", "--rerecord", "--", "x" }, null));
+    try testing.expectError(error.ConflictingModes, parse(&.{ "--rerecord", "--strict", "--", "x" }, null));
+}
+
+test "everything after the separator belongs to the child" {
+    const inv = try parse(&.{ "--strict", "--", "pytest", "--strict", "-k", "x" }, null);
+    try testing.expectEqual(proxy_mod.Mode.strict, inv.mode);
+    try testing.expectEqual(@as(usize, 4), inv.command.wrap.len);
+    try testing.expectEqualStrings("pytest", inv.command.wrap[0]);
+}
+
+test "rerecord takes an optional selector" {
+    const all = try parse(&.{ "--rerecord", "--", "pytest" }, null);
+    try testing.expect(all.rerecord_id == null);
+
+    const one = try parse(&.{ "--rerecord", "a1b2c3d4", "--", "pytest" }, null);
+    try testing.expectEqualStrings("a1b2c3d4", one.rerecord_id.?);
+    try testing.expectEqualStrings("pytest", one.command.wrap[0]);
+}
+
+test "an empty cassette environment variable means unset" {
+    const inv = try parse(&.{ "--", "x" }, "");
+    try testing.expectEqualStrings("default", inv.cassette);
+
+    const named = try parse(&.{ "--", "x" }, "api");
+    try testing.expectEqualStrings("api", named.cassette);
+}
+
+test "the cassette flag overrides the environment" {
+    const inv = try parse(&.{ "--cassette", "flagged", "--", "x" }, "from-env");
+    try testing.expectEqualStrings("flagged", inv.cassette);
+}
+
+test "an unknown argument is an error" {
+    try testing.expectError(error.UnknownArgument, parse(&.{"--nope"}, null));
+}
+
+test "counts are grouped for reading" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try printGrouped(testing.allocator, &out, 812443);
+    try testing.expectEqualStrings("812,443", out.items);
+
+    out.clearRetainingCapacity();
+    try printGrouped(testing.allocator, &out, 0);
+    try testing.expectEqualStrings("0", out.items);
+
+    out.clearRetainingCapacity();
+    try printGrouped(testing.allocator, &out, 1000);
+    try testing.expectEqualStrings("1,000", out.items);
 }

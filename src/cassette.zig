@@ -46,6 +46,26 @@ pub const Body = union(enum) {
     }
 };
 
+/// Short, stable handle for one entry, shown by `ls` and `show` and accepted
+/// by `--rerecord`. Eight hex digits of a hash of the key: long enough that a
+/// collision inside one cassette is not a practical concern, short enough to
+/// type.
+pub fn shortId(key: []const u8) [8]u8 {
+    var out: [8]u8 = undefined;
+    const digest = std.hash.Wyhash.hash(0, key);
+    _ = std.fmt.bufPrint(&out, "{x:0>8}", .{@as(u32, @truncate(digest))}) catch unreachable;
+    return out;
+}
+
+/// Opaque form of a key, for repositories where the cassette must not carry
+/// the prompt in plaintext. Matching is unaffected because the incoming
+/// request is hashed the same way; readable diffs are what is traded away.
+pub fn hashKey(gpa: std.mem.Allocator, key: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    return std.fmt.allocPrint(gpa, "h:{x}", .{&digest});
+}
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,

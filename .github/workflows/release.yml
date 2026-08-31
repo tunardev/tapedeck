@@ -9,7 +9,19 @@ permissions:
   contents: write
 
 jobs:
+  # A tag can be pushed at any commit, including one that never passed CI.
+  # Nothing is published until the suite is green.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test --summary all
+
   build:
+    needs: [test]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,6 +39,9 @@ jobs:
           # one the tests ran on is not the thing that was tested.
           version: 0.16.0
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix out
+      - name: smoke test the native artifact
+        if: matrix.target == 'x86_64-linux-musl'
+        run: ./out/bin/tapedeck --version
       - name: package
         run: |
           tar -C out/bin -czf tapedeck-${{ matrix.target }}.tar.gz tapedeck

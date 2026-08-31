@@ -31,8 +31,16 @@ jobs:
           # Pinned: zig has no stable release, and a minor bump reliably
           # renames something in std. Raise this deliberately, never implicitly.
           version: 0.16.0
-      - run: zig build test --summary all
-      - run: zig fmt --check src build.zig
+      # The count is asserted, not just the exit code: a test step that stops
+      # running looks identical to a passing one.
+      - name: test
+        run: |
+          zig build test --summary all 2>&1 | tee summary.txt
+          grep -qE '[0-9]+/[0-9]+ tests passed' summary.txt
+          grep -q '0 failed' summary.txt || ! grep -q 'failed' summary.txt
+      # Releases ship ReleaseSafe; the safety semantics differ from Debug.
+      - run: zig build test -Doptimize=ReleaseSafe
+      - run: zig fmt --check src build.zig tests
 
   cross:
     runs-on: ubuntu-latest

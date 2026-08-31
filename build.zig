@@ -7,6 +7,10 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("tapedeck", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        // Without this the library compiles at the default mode regardless of
+        // -Doptimize, so releases shipped Debug library code and no test ever
+        // ran in the configuration that ships.
+        .optimize = optimize,
     });
 
     const exe = b.addExecutable(.{

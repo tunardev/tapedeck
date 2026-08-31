@@ -39,16 +39,25 @@ pub const Config = struct {
     /// Per-model prices. Absent by default: a shipped price table goes stale
     /// silently, and a confidently wrong dollar figure is worse than none.
     pricing: []const Price,
+    /// Store a hash of the request instead of the request itself. Matching is
+    /// unaffected; readable diffs are the cost. Off by default because a
+    /// reviewable cassette is usually worth more than an opaque one.
+    hash_keys: bool = false,
 
     /// Dollars for these tokens, or null when the model has no configured price.
+    ///
+    /// Longest-prefix, because providers report dated snapshot ids: a user who
+    /// prices `claude-opus-4` means that to cover `claude-opus-4-20250514`.
     pub fn cost(c: Config, model: []const u8, input: u64, output: u64) ?f64 {
+        var best: ?Price = null;
         for (c.pricing) |p| {
-            if (!std.mem.eql(u8, p.model, model)) continue;
-            const mi: f64 = @floatFromInt(input);
-            const mo: f64 = @floatFromInt(output);
-            return (mi / 1_000_000.0) * p.input + (mo / 1_000_000.0) * p.output;
+            if (!std.mem.startsWith(u8, model, p.model)) continue;
+            if (best == null or p.model.len > best.?.model.len) best = p;
         }
-        return null;
+        const p = best orelse return null;
+        const mi: f64 = @floatFromInt(input);
+        const mo: f64 = @floatFromInt(output);
+        return (mi / 1_000_000.0) * p.input + (mo / 1_000_000.0) * p.output;
     }
 
     pub fn deinit(c: *Config) void {
@@ -85,6 +94,20 @@ pub const Config = struct {
             .object => |o| o,
             else => return error.MalformedConfig,
         };
+
+        // A misspelled key would otherwise be silently ignored, which is
+        // exactly the typo this file promises to catch.
+        const known = [_][]const u8{ "providers", "ignore", "pricing", "hash_keys" };
+        for (root.keys()) |name| {
+            var ok = false;
+            for (known) |k| ok = ok or std.mem.eql(u8, name, k);
+            if (!ok) return error.MalformedConfig;
+        }
+
+        const hash_keys = if (root.get("hash_keys")) |v| switch (v) {
+            .bool => |b| b,
+            else => return error.MalformedConfig,
+        } else false;
 
         var providers: std.ArrayList(Provider) = .empty;
         if (root.get("providers")) |v| {
@@ -147,23 +170,31 @@ pub const Config = struct {
             .arena = arena,
             // A declared provider list replaces the defaults, so a user can
             // front only what they actually call.
-            .providers = if (providers.items.len > 0)
+            // An explicitly empty list is a statement, and different from
+            // omitting the key.
+            .providers = if (root.get("providers") != null)
                 try providers.toOwnedSlice(a)
             else
                 try a.dupe(Provider, &defaults),
             .ignore = try ignore.toOwnedSlice(a),
             .pricing = try pricing.toOwnedSlice(a),
+            .hash_keys = hash_keys,
         };
     }
 };
 
 fn floatField(o: std.json.ObjectMap, name: []const u8) ?f64 {
     const v = o.get(name) orelse return null;
-    return switch (v) {
-        .float => |f| f,
+    const f: f64 = switch (v) {
+        .float => |x| x,
         .integer => |n| @floatFromInt(n),
-        else => null,
+        // An overflowing or non-finite literal arrives as a string.
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch return null,
+        else => return null,
     };
+    // A negative or non-finite price would print a confident nonsense total.
+    if (!std.math.isFinite(f) or f < 0) return null;
+    return f;
 }
 
 fn stringField(o: std.json.ObjectMap, name: []const u8) ?[]const u8 {
@@ -276,4 +307,82 @@ test "pricing is read and applied per model" {
 
     // An unpriced model reports no cost rather than a wrong one.
     try testing.expect(c.cost("some-other-model", 1000, 1000) == null);
+}
+
+test "an unknown top level key is rejected rather than ignored" {
+    var t: Io.Threaded = .init(testing.allocator, .{});
+    defer t.deinit();
+    const io = t.io();
+    const dir = ".tapedeck-cfg-typo";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    // A silently ignored `ignores` would change which calls match.
+    try writeConfig(io, dir,
+        \\{"ignores":["metadata.request_id"]}
+    );
+    try testing.expectError(error.MalformedConfig, Config.load(testing.allocator, io, dir));
+}
+
+test "an explicitly empty provider list is honoured" {
+    var t: Io.Threaded = .init(testing.allocator, .{});
+    defer t.deinit();
+    const io = t.io();
+    const dir = ".tapedeck-cfg-empty";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try writeConfig(io, dir,
+        \\{"providers":[]}
+    );
+    var c = try Config.load(testing.allocator, io, dir);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 0), c.providers.len);
+}
+
+test "pricing matches the longest configured prefix" {
+    var t: Io.Threaded = .init(testing.allocator, .{});
+    defer t.deinit();
+    const io = t.io();
+    const dir = ".tapedeck-cfg-prefix";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try writeConfig(io, dir,
+        \\{"pricing":{"claude-opus-4":{"input":15,"output":75},
+        \\            "claude-opus-4-1":{"input":30,"output":150}}}
+    );
+    var c = try Config.load(testing.allocator, io, dir);
+    defer c.deinit();
+
+    // Providers report dated snapshot ids; an exact match would price nothing.
+    try testing.expectApproxEqAbs(@as(f64, 15.0), c.cost("claude-opus-4-20250514", 1_000_000, 0).?, 0.0001);
+    // The more specific entry wins where both apply.
+    try testing.expectApproxEqAbs(@as(f64, 30.0), c.cost("claude-opus-4-1-20260101", 1_000_000, 0).?, 0.0001);
+    try testing.expect(c.cost("gpt-5", 1000, 1000) == null);
+}
+
+test "a negative price is rejected" {
+    var t: Io.Threaded = .init(testing.allocator, .{});
+    defer t.deinit();
+    const io = t.io();
+    const dir = ".tapedeck-cfg-negative";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try writeConfig(io, dir,
+        \\{"pricing":{"m":{"input":-15,"output":75}}}
+    );
+    try testing.expectError(error.MalformedConfig, Config.load(testing.allocator, io, dir));
+}
+
+test "hash_keys defaults off and is read when present" {
+    var t: Io.Threaded = .init(testing.allocator, .{});
+    defer t.deinit();
+    const io = t.io();
+    const dir = ".tapedeck-cfg-hash";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var off = try Config.load(testing.allocator, io, ".tapedeck-cfg-nothing");
+    defer off.deinit();
+    try testing.expectEqual(false, off.hash_keys);
+
+    try writeConfig(io, dir,
+        \\{"hash_keys":true}
+    );
+    var on = try Config.load(testing.allocator, io, dir);
+    defer on.deinit();
+    try testing.expectEqual(true, on.hash_keys);
 }

@@ -121,8 +121,8 @@ test "record then replay through the installed binary" {
     defer gpa.free(rep.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rep.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
-    // The replay bought nothing, so the same 165 tokens went unspent.
-    try std.testing.expect(std.mem.indexOf(u8, rep.stderr, "165 tokens not spent") != null);
+    // The replay bought nothing, so the same 165 tokens were saved.
+    try std.testing.expect(std.mem.indexOf(u8, rep.stderr, "165 tokens saved") != null);
 
     const a = try cwd.readFileAlloc(io, work ++ "/out1.txt", gpa, .limited(1 << 16));
     defer gpa.free(a);
@@ -209,7 +209,7 @@ test "ls and show read a cassette written to disk" {
     const shown = try runCli(gpa, io, home, &.{ "show", "api" });
     defer gpa.free(shown);
     try std.testing.expect(std.mem.indexOf(u8, shown, "status 429") != null);
-    try std.testing.expect(std.mem.indexOf(u8, shown, "(streamed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "streamed") != null);
     try std.testing.expect(std.mem.indexOf(u8, shown, "slow down") != null);
 }
 
