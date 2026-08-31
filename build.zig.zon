@@ -11,5 +11,6 @@
         "LICENSE",
         "README.md",
         "tests",
+        "scripts",
     },
 }
