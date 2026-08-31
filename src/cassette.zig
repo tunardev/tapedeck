@@ -60,6 +60,12 @@ pub const Exchange = struct {
     /// Recorded without a content-length. Absent in cassettes written before
     /// this field existed, which load as false.
     chunked: bool = false,
+    /// Tokens the provider reported. Zero when it reported none, and absent
+    /// in cassettes written before these fields existed.
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    /// Model the provider named, for pricing. Owned like the other strings.
+    model: []const u8 = "",
 
     pub fn deinit(e: Exchange, gpa: std.mem.Allocator) void {
         gpa.free(e.key);
@@ -68,6 +74,7 @@ pub const Exchange = struct {
             gpa.free(h.value);
         }
         gpa.free(e.headers);
+        gpa.free(e.model);
         e.body.deinit(gpa);
     }
 };
@@ -187,7 +194,14 @@ fn writeLine(gpa: std.mem.Allocator, e: Exchange, out: *std.ArrayList(u8)) !void
         try writeJsonString(gpa, h.value, out);
         try out.append(gpa, '}');
     }
-    try out.appendSlice(gpa, "],\"chunked\":");
+    try out.appendSlice(gpa, "],\"input_tokens\":");
+    try out.appendSlice(gpa, try std.fmt.bufPrint(&num, "{d}", .{e.input_tokens}));
+    try out.appendSlice(gpa, ",\"output_tokens\":");
+    var num2: [24]u8 = undefined;
+    try out.appendSlice(gpa, try std.fmt.bufPrint(&num2, "{d}", .{e.output_tokens}));
+    try out.appendSlice(gpa, ",\"model\":");
+    try writeJsonString(gpa, e.model, out);
+    try out.appendSlice(gpa, ",\"chunked\":");
     try out.appendSlice(gpa, if (e.chunked) "true" else "false");
     try out.appendSlice(gpa, ",\"encoding\":");
     switch (e.body) {
@@ -249,7 +263,22 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Exchange {
         .{ .base64 = try gpa.dupe(u8, payload) };
 
     const chunked = if (obj.get("chunked")) |v| v.bool else false;
-    return .{ .key = key, .status = status, .headers = headers, .body = body, .chunked = chunked };
+    const input_tokens: u64 = if (obj.get("input_tokens")) |v| @intCast(v.integer) else 0;
+    const output_tokens: u64 = if (obj.get("output_tokens")) |v| @intCast(v.integer) else 0;
+    const model = if (obj.get("model")) |v|
+        try gpa.dupe(u8, v.string)
+    else
+        try gpa.dupe(u8, "");
+    return .{
+        .key = key,
+        .status = status,
+        .headers = headers,
+        .body = body,
+        .chunked = chunked,
+        .input_tokens = input_tokens,
+        .output_tokens = output_tokens,
+        .model = model,
+    };
 }
 
 const testing = std.testing;
@@ -265,7 +294,32 @@ fn testExchange(gpa: std.mem.Allocator, key: []const u8, body: []const u8) !Exch
         .status = 200,
         .headers = headers,
         .body = try Body.fromBytes(gpa, body),
+        .model = try gpa.dupe(u8, "test-model"),
+        .input_tokens = 3,
+        .output_tokens = 4,
     };
+}
+
+test "usage survives a save and load" {
+    var t: Io.Threaded = undefined;
+    const io = testIo(&t);
+    defer t.deinit();
+
+    const dir = ".tapedeck-test-usage";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const path = dir ++ "/cassettes/default.jsonl";
+
+    var c = try Cassette.load(testing.allocator, io, path);
+    defer c.deinit();
+    try c.insert(try testExchange(testing.allocator, "k", "body"));
+    try c.save(io);
+
+    var reloaded = try Cassette.load(testing.allocator, io, path);
+    defer reloaded.deinit();
+    const e = reloaded.get("k").?;
+    try testing.expectEqual(@as(u64, 3), e.input_tokens);
+    try testing.expectEqual(@as(u64, 4), e.output_tokens);
+    try testing.expectEqualStrings("test-model", e.model);
 }
 
 test "utf8 body is stored as readable text" {

@@ -52,6 +52,21 @@ guessed, because vendors disagree on the pattern.
 Field paths rather than patterns: exact, and they cannot silently over-match and
 collapse two different calls into one.
 
+Add `pricing` to see what a cassette is worth:
+
+```json
+{ "pricing": { "claude-opus-5": { "input": 15.0, "output": 75.0 } } }
+```
+
+```console
+$ tapedeck ls
+default              1 entries      1500 tokens       516 bytes  $0.0525
+```
+
+Token counts always come from the provider's own response, so they are always
+right. Dollars appear only for models you have priced — a built-in price table
+would go stale silently, and a confidently wrong number is worse than none.
+
 ## Why not a general HTTP cassette library
 
 Agent loops compound. Turn N+1's request embeds turn N's response, so one

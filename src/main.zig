@@ -163,17 +163,26 @@ fn wrap(
     try proxy.flush();
 
     const stats = proxy.snapshot();
-    var buf: [256]u8 = undefined;
+    var buf: [320]u8 = undefined;
     const verb = switch (mode) {
         .record => "recording",
         .strict => "replaying",
         .rerecord => "re-recording",
     };
-    const line = std.fmt.bufPrint(
-        &buf,
-        "  {s} · {d} recorded · {d} replayed · {d} missed\n",
-        .{ verb, stats.recorded, stats.replayed, stats.missed },
-    ) catch "  done\n";
+    const spent = stats.spent_input + stats.spent_output;
+    const saved = stats.saved_input + stats.saved_output;
+    const line = if (saved > 0 and spent == 0)
+        std.fmt.bufPrint(
+            &buf,
+            "  {s} · {d} recorded · {d} replayed · {d} missed · {d} tokens not spent\n",
+            .{ verb, stats.recorded, stats.replayed, stats.missed, saved },
+        ) catch "  done\n"
+    else
+        std.fmt.bufPrint(
+            &buf,
+            "  {s} · {d} recorded · {d} replayed · {d} missed · {d} tokens spent\n",
+            .{ verb, stats.recorded, stats.replayed, stats.missed, spent },
+        ) catch "  done\n";
     printErr(io, line);
 
     std.process.exit(code);
@@ -184,6 +193,12 @@ fn list(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map) !void {
     defer p.deinit(gpa);
     const dir_path = try p.cassetteFile(gpa, "");
     defer gpa.free(dir_path);
+
+    var cfg = config_mod.Config.load(gpa, io, p.root) catch |e| switch (e) {
+        error.MalformedConfig => return fail(io, "config.json is not valid tapedeck config"),
+        else => return e,
+    };
+    defer cfg.deinit();
 
     var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch {
         return printLine(io, "no cassettes recorded yet");
@@ -204,10 +219,28 @@ fn list(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map) !void {
         const stat = dir.statFile(io, entry.name, .{}) catch null;
         const bytes: u64 = if (stat) |st| st.size else 0;
         const name = entry.name[0 .. entry.name.len - ".jsonl".len];
+
+        var tokens: u64 = 0;
+        var dollars: f64 = 0;
+        var priced = false;
+        for (c.values()) |e| {
+            tokens += e.input_tokens + e.output_tokens;
+            // Priced per entry, because each one names its own model.
+            if (cfg.cost(e.model, e.input_tokens, e.output_tokens)) |d| {
+                dollars += d;
+                priced = true;
+            }
+        }
+
         var row: [512]u8 = undefined;
-        const text = try std.fmt.bufPrint(&row, "{s: <24} {d: >5} entries  {d: >8} bytes\n", .{
-            name, c.count(), bytes,
-        });
+        const text = if (priced)
+            try std.fmt.bufPrint(&row, "{s: <20} {d: >5} entries  {d: >9} tokens  {d: >8} bytes  ${d:.4}\n", .{
+                name, c.count(), tokens, bytes, dollars,
+            })
+        else
+            try std.fmt.bufPrint(&row, "{s: <20} {d: >5} entries  {d: >9} tokens  {d: >8} bytes\n", .{
+                name, c.count(), tokens, bytes,
+            });
         try out.appendSlice(gpa, text);
         found += 1;
     }

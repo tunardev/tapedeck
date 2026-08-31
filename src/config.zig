@@ -22,6 +22,13 @@ pub const defaults = [_]Provider{
     .{ .name = "gemini", .base = "https://generativelanguage.googleapis.com", .env = "GOOGLE_GEMINI_BASE_URL" },
 };
 
+/// Dollars per million tokens.
+pub const Price = struct {
+    model: []const u8,
+    input: f64,
+    output: f64,
+};
+
 pub const Config = struct {
     /// Heap-allocated: an `ArenaAllocator` handed out by value loses the
     /// pointer its own `allocator()` captured, and the arena leaks.
@@ -29,6 +36,20 @@ pub const Config = struct {
     providers: []const Provider,
     /// Dotted JSON paths dropped from the match key.
     ignore: []const []const u8,
+    /// Per-model prices. Absent by default: a shipped price table goes stale
+    /// silently, and a confidently wrong dollar figure is worse than none.
+    pricing: []const Price,
+
+    /// Dollars for these tokens, or null when the model has no configured price.
+    pub fn cost(c: Config, model: []const u8, input: u64, output: u64) ?f64 {
+        for (c.pricing) |p| {
+            if (!std.mem.eql(u8, p.model, model)) continue;
+            const mi: f64 = @floatFromInt(input);
+            const mo: f64 = @floatFromInt(output);
+            return (mi / 1_000_000.0) * p.input + (mo / 1_000_000.0) * p.output;
+        }
+        return null;
+    }
 
     pub fn deinit(c: *Config) void {
         const gpa = c.arena.child_allocator;
@@ -52,6 +73,7 @@ pub const Config = struct {
                 .arena = arena,
                 .providers = try a.dupe(Provider, &defaults),
                 .ignore = &.{},
+                .pricing = &.{},
             },
             else => return e,
         };
@@ -86,6 +108,26 @@ pub const Config = struct {
             }
         }
 
+        var pricing: std.ArrayList(Price) = .empty;
+        if (root.get("pricing")) |v| {
+            const o = switch (v) {
+                .object => |o| o,
+                else => return error.MalformedConfig,
+            };
+            var it = o.iterator();
+            while (it.next()) |kv| {
+                const spec = switch (kv.value_ptr.*) {
+                    .object => |so| so,
+                    else => return error.MalformedConfig,
+                };
+                try pricing.append(a, .{
+                    .model = try a.dupe(u8, kv.key_ptr.*),
+                    .input = floatField(spec, "input") orelse return error.MalformedConfig,
+                    .output = floatField(spec, "output") orelse return error.MalformedConfig,
+                });
+            }
+        }
+
         var ignore: std.ArrayList([]const u8) = .empty;
         if (root.get("ignore")) |v| {
             const items = switch (v) {
@@ -110,9 +152,19 @@ pub const Config = struct {
             else
                 try a.dupe(Provider, &defaults),
             .ignore = try ignore.toOwnedSlice(a),
+            .pricing = try pricing.toOwnedSlice(a),
         };
     }
 };
+
+fn floatField(o: std.json.ObjectMap, name: []const u8) ?f64 {
+    const v = o.get(name) orelse return null;
+    return switch (v) {
+        .float => |f| f,
+        .integer => |n| @floatFromInt(n),
+        else => null,
+    };
+}
 
 fn stringField(o: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = o.get(name) orelse return null;
@@ -202,4 +254,26 @@ test "a provider missing a field is an error" {
         \\{"providers":[{"name":"local","base":"http://x"}]}
     );
     try testing.expectError(error.MalformedConfig, Config.load(testing.allocator, io, dir));
+}
+
+test "pricing is read and applied per model" {
+    var t: Io.Threaded = .init(testing.allocator, .{});
+    defer t.deinit();
+    const io = t.io();
+    const dir = ".tapedeck-cfg-price";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try writeConfig(io, dir,
+        \\{"pricing":{"claude-opus-5":{"input":15.0,"output":75.0}}}
+    );
+
+    var c = try Config.load(testing.allocator, io, dir);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), c.pricing.len);
+
+    // 1M input at $15 plus 1M output at $75.
+    const total = c.cost("claude-opus-5", 1_000_000, 1_000_000).?;
+    try testing.expectApproxEqAbs(@as(f64, 90.0), total, 0.0001);
+
+    // An unpriced model reports no cost rather than a wrong one.
+    try testing.expect(c.cost("some-other-model", 1000, 1000) == null);
 }

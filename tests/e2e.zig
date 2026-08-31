@@ -5,7 +5,7 @@ const Io = std.Io;
 const build_options = @import("build_options");
 
 const fake_port = 38897;
-const sse = "event: a\ndata: {\"t\":1}\n\n";
+const sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":45}}\n\n";
 
 fn hitCount(io: Io, gpa: std.mem.Allocator, path: []const u8) !usize {
     const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64)) catch return 0;
@@ -23,7 +23,7 @@ const fake_py =
     \\        self.rfile.read(int(self.headers.get("content-length", 0)))
     \\        H_["n"] += 1
     \\        open(os.environ["HITFILE"], "w").write(str(H_["n"]))
-    \\        b = b'event: a\ndata: {"t":1}\n\n'
+    \\        b = b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-opus-5","usage":{"input_tokens":120,"output_tokens":1}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":45}}\n\n'
     \\        self.send_response(200)
     \\        self.send_header("content-type", "text/event-stream")
     \\        self.send_header("content-length", str(len(b)))
@@ -99,22 +99,30 @@ test "record then replay through the installed binary" {
     // Record.
     try env.put("OUT", work ++ "/out1.txt");
     try env.put("PAYLOAD", "{\"model\":\"m\",\"messages\":[]}");
-    var rec = try std.process.spawn(io, .{
+    const rec = try std.process.run(gpa, io, .{
         .argv = &.{ build_options.exe_path, "--", "sh", "-c", client },
         .environ_map = &env,
     });
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rec.wait(io));
+    defer gpa.free(rec.stdout);
+    defer gpa.free(rec.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rec.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
+    // 120 input + 45 output, from the stub's anthropic-shaped usage events.
+    try std.testing.expect(std.mem.indexOf(u8, rec.stderr, "165 tokens spent") != null);
 
     // Replay: same logical call, drifted key order, strict so it cannot call out.
     try env.put("OUT", work ++ "/out2.txt");
     try env.put("PAYLOAD", "{\"messages\":[],\"model\":\"m\"}");
-    var rep = try std.process.spawn(io, .{
+    const rep = try std.process.run(gpa, io, .{
         .argv = &.{ build_options.exe_path, "--strict", "--", "sh", "-c", client },
         .environ_map = &env,
     });
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rep.wait(io));
+    defer gpa.free(rep.stdout);
+    defer gpa.free(rep.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rep.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
+    // The replay bought nothing, so the same 165 tokens went unspent.
+    try std.testing.expect(std.mem.indexOf(u8, rep.stderr, "165 tokens not spent") != null);
 
     const a = try cwd.readFileAlloc(io, work ++ "/out1.txt", gpa, .limited(1 << 16));
     defer gpa.free(a);
@@ -281,12 +289,16 @@ test "a user declared provider works end to end" {
         \\ -d "$PAYLOAD" -o "$OUT"
     ;
     try env.put("PAYLOAD", "{\"model\":\"m\",\"metadata\":{\"request_id\":\"first\"}}");
-    var rec = try std.process.spawn(io, .{
+    const rec = try std.process.run(gpa, io, .{
         .argv = &.{ build_options.exe_path, "--", "sh", "-c", client },
         .environ_map = &env,
     });
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rec.wait(io));
+    defer gpa.free(rec.stdout);
+    defer gpa.free(rec.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, rec.term);
     try std.testing.expectEqual(@as(usize, 1), try hitCount(io, gpa, hitfile));
+    // 120 input + 45 output, from the stub's anthropic-shaped usage events.
+    try std.testing.expect(std.mem.indexOf(u8, rec.stderr, "165 tokens spent") != null);
 
     // Only the ignored field differs, so strict replay must still hit.
     try env.put("PAYLOAD", "{\"model\":\"m\",\"metadata\":{\"request_id\":\"second\"}}");

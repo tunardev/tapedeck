@@ -9,6 +9,7 @@ const cassette_mod = @import("cassette.zig");
 const matching = @import("matching.zig");
 const redact = @import("redact.zig");
 const upstream = @import("upstream.zig");
+const usage_mod = @import("usage.zig");
 
 const Cassette = cassette_mod.Cassette;
 const Exchange = cassette_mod.Exchange;
@@ -38,6 +39,12 @@ pub const Stats = struct {
     recorded: usize = 0,
     replayed: usize = 0,
     missed: usize = 0,
+    /// Tokens actually bought this run.
+    spent_input: u64 = 0,
+    spent_output: u64 = 0,
+    /// Tokens a replay avoided buying.
+    saved_input: u64 = 0,
+    saved_output: u64 = 0,
 };
 
 pub const Upstream = struct {
@@ -251,6 +258,7 @@ pub const Proxy = struct {
             if (p.lookup(entry_key)) |hit| {
                 defer hit.deinit(gpa);
                 p.bump(.replayed);
+                p.addTokens(.saved, hit.input_tokens, hit.output_tokens);
                 return p.respond(req, hit.status, hit.headers, hit.body, hit.chunked);
             }
             if (p.mode == .strict) {
@@ -269,8 +277,10 @@ pub const Proxy = struct {
         };
         defer got.deinit(gpa);
 
-        try p.record(entry_key, got);
+        const u = usage_mod.parse(gpa, got.body);
+        try p.record(entry_key, got, u);
         p.bump(.recorded);
+        p.addTokens(.spent, u.input, u.output);
 
         const stored = try gpa.alloc(cassette_mod.Header, got.headers.len);
         defer gpa.free(stored);
@@ -287,7 +297,22 @@ pub const Proxy = struct {
         return cloneExchange(p.gpa, hit) catch null;
     }
 
-    fn record(p: *Proxy, entry_key: []const u8, got: upstream.Response) !void {
+    fn addTokens(p: *Proxy, comptime which: enum { spent, saved }, input: u64, output: u64) void {
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        switch (which) {
+            .spent => {
+                p.stats.spent_input += input;
+                p.stats.spent_output += output;
+            },
+            .saved => {
+                p.stats.saved_input += input;
+                p.stats.saved_output += output;
+            },
+        }
+    }
+
+    fn record(p: *Proxy, entry_key: []const u8, got: upstream.Response, u: usage_mod.Usage) !void {
         const gpa = p.gpa;
         const headers = try gpa.alloc(cassette_mod.Header, got.headers.len);
         errdefer gpa.free(headers);
@@ -304,6 +329,9 @@ pub const Proxy = struct {
             .headers = headers,
             .body = try cassette_mod.Body.fromBytes(gpa, got.body),
             .chunked = got.chunked,
+            .input_tokens = u.input,
+            .output_tokens = u.output,
+            .model = try gpa.dupe(u8, u.model),
         };
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
@@ -400,6 +428,9 @@ fn cloneExchange(gpa: std.mem.Allocator, e: Exchange) !Exchange {
         .headers = headers,
         .body = body,
         .chunked = e.chunked,
+        .input_tokens = e.input_tokens,
+        .output_tokens = e.output_tokens,
+        .model = try gpa.dupe(u8, e.model),
     };
 }
 
