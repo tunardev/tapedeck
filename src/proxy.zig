@@ -19,6 +19,10 @@ const Exchange = cassette_mod.Exchange;
 /// knows the tool failed rather than the API.
 const tapedeck_error: u16 = 599;
 
+/// Ceiling on in-flight connection workers. Well above any realistic test
+/// runner's parallelism, low enough that a runaway client cannot exhaust threads.
+const max_workers: usize = 64;
+
 pub const Mode = enum { record, strict };
 
 pub const Stats = struct {
@@ -45,6 +49,7 @@ pub const Proxy = struct {
     mutex: Io.Mutex = .init,
     stats: Stats = .{},
     running: std.atomic.Value(bool) = .init(true),
+    workers: std.atomic.Value(usize) = .init(0),
 
     /// Binds the first free port at or above `port_hint`.
     ///
@@ -103,13 +108,39 @@ pub const Proxy = struct {
     }
 
     /// Serve until `shutdown` is called. Blocking; run it on its own thread.
+    ///
+    /// One worker per connection: a test runner with parallel workers issues
+    /// concurrent calls, and handling them inline would serialise every one
+    /// behind the slowest upstream response.
     pub fn serve(p: *Proxy) void {
         while (p.running.load(.seq_cst)) {
-            var stream = p.server.accept(p.io) catch break;
-            defer stream.close(p.io);
-            if (!p.running.load(.seq_cst)) break;
+            const stream = p.server.accept(p.io) catch break;
+            if (!p.running.load(.seq_cst)) {
+                stream.close(p.io);
+                break;
+            }
+            if (p.workers.fetchAdd(1, .seq_cst) < max_workers) {
+                if (std.Thread.spawn(.{}, work, .{ p, stream })) |th| {
+                    th.detach();
+                    continue;
+                } else |_| {}
+            }
+            // At the cap, or out of threads: handle it here rather than drop it.
+            _ = p.workers.fetchSub(1, .seq_cst);
             p.handleConnection(stream) catch {};
+            stream.close(p.io);
         }
+        // Returning while workers still hold `p` would let the caller free it
+        // underneath them.
+        while (p.workers.load(.seq_cst) > 0) {
+            p.io.sleep(.fromMilliseconds(1), .awake) catch break;
+        }
+    }
+
+    fn work(p: *Proxy, stream: net.Stream) void {
+        defer _ = p.workers.fetchSub(1, .seq_cst);
+        defer stream.close(p.io);
+        p.handleConnection(stream) catch {};
     }
 
     /// Unblocks a thread parked in `accept`.
@@ -370,8 +401,11 @@ const Fake = struct {
     io: Io,
     hits: std.atomic.Value(usize) = .init(0),
     running: std.atomic.Value(bool) = .init(true),
+    workers: std.atomic.Value(usize) = .init(0),
     payload: []const u8,
     status: u16,
+    delay_ms: u64 = 0,
+    inflight: std.atomic.Value(usize) = .init(0),
 
     fn start(io: Io, port_hint: u16, payload: []const u8, status: u16) !Fake {
         var port = port_hint;
@@ -385,31 +419,53 @@ const Fake = struct {
 
     fn serve(f: *Fake) void {
         while (f.running.load(.seq_cst)) {
-            var stream = f.server.accept(f.io) catch break;
-            defer stream.close(f.io);
-            var in_buf: [8192]u8 = undefined;
-            var out_buf: [8192]u8 = undefined;
-            var reader = stream.reader(f.io, &in_buf);
-            var writer = stream.writer(f.io, &out_buf);
-            var srv = http.Server.init(&reader.interface, &writer.interface);
-            var req = srv.receiveHead() catch continue;
-            var drain: [8192]u8 = undefined;
-            const br = req.readerExpectNone(&drain);
-            var sink: [4096]u8 = undefined;
-            while (true) {
-                const n = br.readSliceShort(&sink) catch break;
-                if (n == 0) break;
+            const stream = f.server.accept(f.io) catch break;
+            if (!f.running.load(.seq_cst)) {
+                stream.close(f.io);
+                break;
             }
-            _ = f.hits.fetchAdd(1, .seq_cst);
-            req.respond(f.payload, .{
-                .status = @enumFromInt(f.status),
-                .extra_headers = &.{
-                    .{ .name = "content-type", .value = "text/event-stream" },
-                    .{ .name = "set-cookie", .value = "session=leaked-credential" },
-                },
-                .keep_alive = false,
-            }) catch {};
+            // Concurrent, or the stub itself serialises what the proxy just
+            // parallelised and the timing assertion measures the wrong thing.
+            _ = f.inflight.fetchAdd(1, .seq_cst);
+            if (std.Thread.spawn(.{}, Fake.handle, .{ f, stream })) |th| {
+                th.detach();
+            } else |_| {
+                _ = f.inflight.fetchSub(1, .seq_cst);
+                stream.close(f.io);
+            }
         }
+        while (f.inflight.load(.seq_cst) > 0) {
+            f.io.sleep(.fromMilliseconds(1), .awake) catch break;
+        }
+    }
+
+    fn handle(f: *Fake, stream: net.Stream) void {
+        defer _ = f.inflight.fetchSub(1, .seq_cst);
+        defer stream.close(f.io);
+        var in_buf: [8192]u8 = undefined;
+        var out_buf: [8192]u8 = undefined;
+        var reader = stream.reader(f.io, &in_buf);
+        var writer = stream.writer(f.io, &out_buf);
+        var srv = http.Server.init(&reader.interface, &writer.interface);
+        var req = srv.receiveHead() catch return;
+        var drain: [8192]u8 = undefined;
+        const br = req.readerExpectNone(&drain);
+        var sink: [4096]u8 = undefined;
+        while (true) {
+            const n = br.readSliceShort(&sink) catch break;
+            if (n == 0) break;
+        }
+        _ = f.hits.fetchAdd(1, .seq_cst);
+        if (f.delay_ms > 0) f.io.sleep(.fromMilliseconds(@intCast(f.delay_ms)), .awake) catch {};
+        req.respond(f.payload, .{
+            .status = @enumFromInt(f.status),
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/event-stream" },
+                .{ .name = "set-cookie", .value = "session=leaked-credential" },
+            },
+            .keep_alive = false,
+        }) catch {};
+        writer.interface.flush() catch {};
     }
 
     fn stop(f: *Fake) void {
@@ -609,4 +665,67 @@ test "base urls carry the provider prefix" {
     const want = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/anthropic", .{p.port});
     defer gpa.free(want);
     try testing.expectEqualStrings(want, vars[0][1]);
+}
+
+const ConcurrentCaller = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    port: u16,
+    index: usize,
+    ok: bool = false,
+
+    fn call(c: *ConcurrentCaller) void {
+        // Distinct bodies so every request is a cache miss and must reach the
+        // provider; identical bodies would replay and hide serialisation.
+        var buf: [64]u8 = undefined;
+        const body = std.fmt.bufPrint(&buf, "{{\"model\":\"m\",\"n\":{d}}}", .{c.index}) catch return;
+        const got = callProxy(c.gpa, c.io, c.port, "/anthropic/v1/messages", body) catch return;
+        defer c.gpa.free(got.body);
+        c.ok = got.status == 200;
+    }
+};
+
+test "concurrent requests are not serialised behind each other" {
+    const gpa = testing.allocator;
+    var t: Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    var fake = try Fake.start(io, 39900, "data: ok\n\n", 200);
+    fake.delay_ms = 300;
+    const fake_thread = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+    defer fake_thread.join();
+    defer fake.stop();
+
+    const dir = ".tapedeck-proxy-conc";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.port});
+    defer gpa.free(base);
+    const ups = [_]Upstream{.{ .prefix = "anthropic", .base = base }};
+
+    var p = try Proxy.bind(gpa, io, dir ++ "/cassettes/default.jsonl", .record, &ups, 39950);
+    defer p.deinit();
+    const serving = try std.Thread.spawn(.{}, Proxy.serve, .{&p});
+
+    const n = 4;
+    var callers: [n]ConcurrentCaller = undefined;
+    var threads: [n]std.Thread = undefined;
+    const started = Io.Timestamp.now(io, .awake);
+    for (0..n) |i| {
+        callers[i] = .{ .gpa = gpa, .io = io, .port = p.port, .index = i };
+        threads[i] = try std.Thread.spawn(.{}, ConcurrentCaller.call, .{&callers[i]});
+    }
+    for (&threads) |*th| th.join();
+    const elapsed_ms = @divTrunc(Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds, 1_000_000);
+
+    for (callers) |c| try testing.expect(c.ok);
+    try testing.expectEqual(@as(usize, n), fake.hits.load(.seq_cst));
+
+    p.shutdown();
+    serving.join();
+
+    // Serial handling costs n*300ms; concurrent costs roughly one delay. The
+    // midpoint leaves generous headroom for a loaded CI runner.
+    try testing.expect(elapsed_ms < 800);
 }
