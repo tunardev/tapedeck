@@ -29,7 +29,7 @@ full agent test suite.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/getsolmo/tapedeck/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tunardev/tapedeck/main/packaging/install.sh | sh
 ```
 
 A single static binary, no runtime. Built in Zig with **zero dependencies** —

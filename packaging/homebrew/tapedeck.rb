@@ -1,27 +1,27 @@
 class Tapedeck < Formula
   desc "Record your LLM calls once, replay them free"
-  homepage "https://github.com/getsolmo/tapedeck"
+  homepage "https://github.com/tunardev/tapedeck"
   version "0.1.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/getsolmo/tapedeck/releases/download/v#{version}/tapedeck-aarch64-macos.tar.gz"
+      url "https://github.com/tunardev/tapedeck/releases/download/v#{version}/tapedeck-aarch64-macos.tar.gz"
       sha256 "REPLACE_WITH_RELEASE_SHA256"
     end
     on_intel do
-      url "https://github.com/getsolmo/tapedeck/releases/download/v#{version}/tapedeck-x86_64-macos.tar.gz"
+      url "https://github.com/tunardev/tapedeck/releases/download/v#{version}/tapedeck-x86_64-macos.tar.gz"
       sha256 "REPLACE_WITH_RELEASE_SHA256"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/getsolmo/tapedeck/releases/download/v#{version}/tapedeck-aarch64-linux-musl.tar.gz"
+      url "https://github.com/tunardev/tapedeck/releases/download/v#{version}/tapedeck-aarch64-linux-musl.tar.gz"
       sha256 "REPLACE_WITH_RELEASE_SHA256"
     end
     on_intel do
-      url "https://github.com/getsolmo/tapedeck/releases/download/v#{version}/tapedeck-x86_64-linux-musl.tar.gz"
+      url "https://github.com/tunardev/tapedeck/releases/download/v#{version}/tapedeck-x86_64-linux-musl.tar.gz"
       sha256 "REPLACE_WITH_RELEASE_SHA256"
     end
   end

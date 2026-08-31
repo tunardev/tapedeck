@@ -1,9 +1,9 @@
 #!/bin/sh
 # Install tapedeck. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/getsolmo/tapedeck/main/packaging/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/tunardev/tapedeck/main/packaging/install.sh | sh
 set -eu
 
-REPO="getsolmo/tapedeck"
+REPO="tunardev/tapedeck"
 VERSION="${TAPEDECK_VERSION:-latest}"
 
 detect_target() {
