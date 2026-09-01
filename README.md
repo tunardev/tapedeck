@@ -159,7 +159,8 @@ zig build test --summary all
 zig build
 ```
 
-Requires Zig 0.16.0 exactly — pinned in `.zigversion` and in CI, because Zig has
+Requires Zig 0.16.0 exactly — pinned by `minimum_zig_version` in `build.zig.zon`,
+which CI reads directly. Zig has
 no stable release and a minor bump reliably renames something in `std`. The test
 suite needs `python3` and `curl` for its end-to-end cases.
 
