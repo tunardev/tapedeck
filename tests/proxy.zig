@@ -25,6 +25,7 @@ const Fake = struct {
     delay_ms: u64 = 0,
     chunked: bool = false,
     inflight: std.atomic.Value(usize) = .init(0),
+    peak_inflight: std.atomic.Value(usize) = .init(0),
 
     fn start(io: Io, port_hint: u16, payload: []const u8, status: u16) !Fake {
         var port = port_hint;
@@ -58,6 +59,7 @@ const Fake = struct {
 
     fn handle(f: *Fake, stream: net.Stream) void {
         defer _ = f.inflight.fetchSub(1, .seq_cst);
+        f.recordPeak();
         defer stream.close(f.io);
         var in_buf: [8192]u8 = undefined;
         var out_buf: [8192]u8 = undefined;
@@ -99,6 +101,14 @@ const Fake = struct {
             }) catch {};
         }
         writer.interface.flush() catch {};
+    }
+
+    fn recordPeak(f: *Fake) void {
+        const now = f.inflight.load(.seq_cst);
+        var seen = f.peak_inflight.load(.seq_cst);
+        while (now > seen) {
+            seen = f.peak_inflight.cmpxchgWeak(seen, now, .seq_cst, .seq_cst) orelse break;
+        }
     }
 
     fn stop(f: *Fake) void {
@@ -372,13 +382,12 @@ test "concurrent requests are not serialised behind each other" {
     const n = 4;
     var callers: [n]ConcurrentCaller = undefined;
     var threads: [n]std.Thread = undefined;
-    const started = Io.Timestamp.now(io, .awake);
+
     for (0..n) |i| {
         callers[i] = .{ .gpa = gpa, .io = io, .port = p.port, .index = i };
         threads[i] = try std.Thread.spawn(.{}, ConcurrentCaller.call, .{&callers[i]});
     }
     for (&threads) |*th| th.join();
-    const elapsed_ms = @divTrunc(Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds, 1_000_000);
 
     for (callers) |c| try testing.expect(c.ok);
     try testing.expectEqual(@as(usize, n), fake.hits.load(.seq_cst));
@@ -386,7 +395,7 @@ test "concurrent requests are not serialised behind each other" {
     p.shutdown();
     serving.join();
 
-    try testing.expect(elapsed_ms < 800);
+    try testing.expect(fake.peak_inflight.load(.seq_cst) >= 2);
 }
 
 test "error status and body round trip exactly" {
