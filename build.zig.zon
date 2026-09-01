@@ -1,0 +1,16 @@
+.{
+    .name = .tapedeck,
+    .version = "0.1.0",
+    .fingerprint = 0x54e11b852984732d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+        "tests",
+        "packaging",
+    },
+}
