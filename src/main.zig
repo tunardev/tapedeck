@@ -245,9 +245,6 @@ fn wrap(
         gpa.free(injected);
     }
 
-    // Ctrl-C reaches the whole foreground group, so the child dies on its own.
-    // tapedeck has to survive it long enough to write down what was already
-    // paid for; the default disposition would discard the entire run.
     catchInterrupts();
 
     const serving = try std.Thread.spawn(.{}, proxy_mod.Proxy.serve, .{&proxy});

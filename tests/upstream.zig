@@ -84,9 +84,6 @@ const Stub = struct {
                 writer.interface.flush() catch {};
             },
             .short_body => {
-                // Declares far more than it sends, then hangs up: a provider
-                // dropping mid-response. http.Server would not let us frame
-                // this, so the bytes go out raw.
                 var raw = stream.writer(s.io, &out_buf);
                 raw.interface.writeAll(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5000\r\n\r\ntruncated",
@@ -144,10 +141,7 @@ test "credentials reach the provider but never a redirect target" {
     const got = try request(gpa, io, provider.port, "{}");
     defer got.deinit(gpa);
 
-    // The provider must actually receive the key, or nothing authenticates.
     try testing.expect(provider.saw_credential.load(.seq_cst));
-    // The 3xx is recorded rather than followed, so no other host is contacted
-    // and the key cannot travel with it.
     try testing.expectEqual(@as(u16, 302), got.status);
     try testing.expectEqual(@as(usize, 0), elsewhere.hits.load(.seq_cst));
     try testing.expect(!elsewhere.saw_credential.load(.seq_cst));
@@ -178,8 +172,6 @@ test "a large request body is forwarded whole" {
     defer pt.join();
     defer provider.stop();
 
-    // Well past the 16 KB connection buffers, and the size of a real request
-    // carrying a system prompt and tool schemas.
     const size = 256 * 1024;
     const body = try gpa.alloc(u8, size);
     defer gpa.free(body);
