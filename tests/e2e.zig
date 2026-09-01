@@ -18,7 +18,7 @@ fn readPort(io: Io, gpa: std.mem.Allocator, path: []const u8) !u16 {
     return std.fmt.parseInt(u16, trimmed, 10) catch error.NotReady;
 }
 
-fn awaitStub(io: Io, gpa: std.mem.Allocator, port_file: []const u8) !u16 {
+fn awaitStub(io: Io, gpa: std.mem.Allocator, port_file: []const u8, err_file: []const u8) !u16 {
     var waited: usize = 0;
     while (waited < 100) : (waited += 1) {
         if (readPort(io, gpa, port_file)) |port| {
@@ -30,6 +30,10 @@ fn awaitStub(io: Io, gpa: std.mem.Allocator, port_file: []const u8) !u16 {
         } else |_| {}
         io.sleep(.fromMilliseconds(100), .awake) catch {};
     }
+    const why = Io.Dir.cwd().readFileAlloc(io, err_file, gpa, .limited(4096)) catch
+        try gpa.dupe(u8, "(no stderr captured)");
+    defer gpa.free(why);
+    std.debug.print("\n  stub never started; its stderr was:\n{s}\n", .{why});
     return error.StubNeverStarted;
 }
 
@@ -82,16 +86,16 @@ test "record then replay through the installed binary" {
     try env.put("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
 
     const port_file = work ++ "/port.txt";
+    const err_file = work ++ "/stub-err.txt";
     try env.put("PORTFILE", port_file);
     var fake = try std.process.spawn(io, .{
-        .argv = &.{ "python3", py_path },
+        .argv = &.{ "sh", "-c", "exec python3 \"$0\" 2> \"$1\"", py_path, err_file },
         .environ_map = &env,
         .stdout = .ignore,
-        .stderr = .ignore,
     });
     defer fake.kill(io);
 
-    const port = try awaitStub(io, gpa, port_file);
+    const port = try awaitStub(io, gpa, port_file, err_file);
 
     const upstream = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
     defer gpa.free(upstream);
@@ -261,16 +265,16 @@ test "a user declared provider works end to end" {
     try env.put("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
 
     const port_file = work ++ "/port.txt";
+    const err_file = work ++ "/stub-err.txt";
     try env.put("PORTFILE", port_file);
     var fake = try std.process.spawn(io, .{
-        .argv = &.{ "python3", py_path },
+        .argv = &.{ "sh", "-c", "exec python3 \"$0\" 2> \"$1\"", py_path, err_file },
         .environ_map = &env,
         .stdout = .ignore,
-        .stderr = .ignore,
     });
     defer fake.kill(io);
 
-    const port = try awaitStub(io, gpa, port_file);
+    const port = try awaitStub(io, gpa, port_file, err_file);
 
     const upstream = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
     defer gpa.free(upstream);
