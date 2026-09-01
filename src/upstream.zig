@@ -47,7 +47,7 @@ pub fn isHopHeader(name: []const u8) bool {
     return false;
 }
 
-fn isCredential(name: []const u8) bool {
+pub fn isCredential(name: []const u8) bool {
     const names = [_][]const u8{
         "authorization",
         "proxy-authorization",
@@ -61,6 +61,13 @@ fn isCredential(name: []const u8) bool {
     };
     for (names) |h| {
         if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
+
+fn hasControlBytes(text: []const u8) bool {
+    for (text) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
     }
     return false;
 }
@@ -80,15 +87,10 @@ pub fn forward(
 
     var extra: std.ArrayList(http.Header) = .empty;
     defer extra.deinit(gpa);
-    var privileged: std.ArrayList(http.Header) = .empty;
-    defer privileged.deinit(gpa);
     for (req.headers) |h| {
         if (isHopHeader(h.name)) continue;
-        if (isCredential(h.name)) {
-            try privileged.append(gpa, .{ .name = h.name, .value = h.value });
-        } else {
-            try extra.append(gpa, .{ .name = h.name, .value = h.value });
-        }
+        if (hasControlBytes(h.name) or hasControlBytes(h.value)) continue;
+        try extra.append(gpa, .{ .name = h.name, .value = h.value });
     }
 
     var client: http.Client = .{ .allocator = gpa, .io = io };
@@ -96,8 +98,7 @@ pub fn forward(
 
     var r = try client.request(req.method, uri, .{
         .extra_headers = extra.items,
-        .privileged_headers = privileged.items,
-        .redirect_behavior = .not_allowed,
+        .redirect_behavior = .unhandled,
         .keep_alive = false,
     });
     defer r.deinit();

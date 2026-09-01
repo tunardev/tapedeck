@@ -13,6 +13,9 @@ const Cassette = cassette_mod.Cassette;
 const Exchange = cassette_mod.Exchange;
 
 const tapedeck_error: u16 = 599;
+const connection_buffer_bytes = 16 * 1024;
+const transfer_chunk_bytes = 4096;
+const port_scan_span: u16 = 200;
 
 const max_workers: usize = 64;
 
@@ -67,7 +70,7 @@ pub const Proxy = struct {
         errdefer c.deinit();
 
         var port = port_hint;
-        while (port < port_hint +| 200) : (port += 1) {
+        while (port < port_hint +| port_scan_span) : (port += 1) {
             const addr: net.IpAddress = try .parseIp4("127.0.0.1", port);
             const server = addr.listen(io, .{}) catch |e| switch (e) {
                 error.AddressInUse => continue,
@@ -163,8 +166,8 @@ pub const Proxy = struct {
     }
 
     fn handleConnection(p: *Proxy, stream: net.Stream) !void {
-        var in_buf: [16 * 1024]u8 = undefined;
-        var out_buf: [16 * 1024]u8 = undefined;
+        var in_buf: [connection_buffer_bytes]u8 = undefined;
+        var out_buf: [connection_buffer_bytes]u8 = undefined;
         var reader = stream.reader(p.io, &in_buf);
         var writer = stream.writer(p.io, &out_buf);
         var server = http.Server.init(&reader.interface, &writer.interface);
@@ -266,13 +269,13 @@ pub const Proxy = struct {
     }
 
     fn readBody(gpa: std.mem.Allocator, req: *http.Server.Request, out: *std.ArrayList(u8)) !void {
-        var buf: [16 * 1024]u8 = undefined;
+        var buf: [connection_buffer_bytes]u8 = undefined;
         const reader = if (req.head.expect != null)
             try req.readerExpectContinue(&buf)
         else
             req.readerExpectNone(&buf);
 
-        var chunk: [4096]u8 = undefined;
+        var chunk: [transfer_chunk_bytes]u8 = undefined;
         while (true) {
             const n = reader.readSliceShort(&chunk) catch return error.TruncatedRequestBody;
             if (n == 0) break;
@@ -338,7 +341,7 @@ pub const Proxy = struct {
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
         const hit = p.cassette.get(entry_key) orelse return null;
-        return cloneExchange(p.gpa, hit) catch null;
+        return cloneExchange(p.gpa, hit.*) catch null;
     }
 
     fn addTokens(p: *Proxy, comptime which: enum { spent, saved }, input: u64, output: u64) void {
@@ -419,7 +422,7 @@ pub const Proxy = struct {
         }
 
         if (chunked) {
-            var out_buf: [16 * 1024]u8 = undefined;
+            var out_buf: [connection_buffer_bytes]u8 = undefined;
             var w = try req.respondStreaming(&out_buf, .{
                 .respond_options = .{
                     .status = @enumFromInt(status),
@@ -440,13 +443,21 @@ pub const Proxy = struct {
 };
 
 fn fail(req: *http.Server.Request, message: []const u8) !void {
-    var buf: [512]u8 = undefined;
-    const payload = std.fmt.bufPrint(
-        &buf,
-        "{{\"error\":{{\"type\":\"tapedeck\",\"message\":\"{s}\"}}}}",
-        .{message},
-    ) catch "{\"error\":{\"type\":\"tapedeck\"}}";
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    std.json.Stringify.value(.{
+        .@"error" = .{ .type = "tapedeck", .message = message },
+    }, .{}, &w) catch return respondFallback(req);
+    const payload = w.buffered();
     try req.respond(payload, .{
+        .status = @enumFromInt(tapedeck_error),
+        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        .keep_alive = false,
+    });
+}
+
+fn respondFallback(req: *http.Server.Request) !void {
+    try req.respond("{\"error\":{\"type\":\"tapedeck\"}}", .{
         .status = @enumFromInt(tapedeck_error),
         .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
         .keep_alive = false,

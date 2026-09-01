@@ -11,7 +11,24 @@ const runner = tapedeck.runner;
 const Paths = paths_mod.Paths;
 
 const exit_tapedeck_error: u8 = 120;
+const exit_interrupted: u8 = 130;
 const exit_usage: u8 = 121;
+
+var interrupted: std.atomic.Value(bool) = .init(false);
+
+fn onInterrupt(_: std.posix.SIG) callconv(.c) void {
+    interrupted.store(true, .seq_cst);
+}
+
+fn catchInterrupts() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onInterrupt },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+}
 
 const usage =
     \\tapedeck — record your LLM calls once, replay them free
@@ -228,6 +245,11 @@ fn wrap(
         gpa.free(injected);
     }
 
+    // Ctrl-C reaches the whole foreground group, so the child dies on its own.
+    // tapedeck has to survive it long enough to write down what was already
+    // paid for; the default disposition would discard the entire run.
+    catchInterrupts();
+
     const serving = try std.Thread.spawn(.{}, proxy_mod.Proxy.serve, .{&proxy});
     const result = runner.run(io, command, env, injected);
 
@@ -241,7 +263,9 @@ fn wrap(
     };
 
     try report(gpa, io, inv.mode, proxy.snapshot());
-    std.process.exit(try result);
+
+    const code = try result;
+    std.process.exit(if (interrupted.load(.seq_cst) and code == 0) exit_interrupted else code);
 }
 
 fn requireEntry(gpa: std.mem.Allocator, io: Io, path: []const u8, id: []const u8) !void {

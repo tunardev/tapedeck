@@ -115,8 +115,8 @@ pub const Cassette = struct {
         c.gpa.free(c.path);
     }
 
-    pub fn get(c: *const Cassette, key: []const u8) ?Exchange {
-        return c.entries.get(key);
+    pub fn get(c: *const Cassette, key: []const u8) ?*const Exchange {
+        return c.entries.getPtr(key);
     }
 
     pub fn count(c: *const Cassette) usize {

@@ -105,6 +105,10 @@ fn writeValue(
             try writeCount(gpa, out, 'o', kept);
             for (names[0..kept]) |name| {
                 try writeScalar(gpa, out, 'k', name, &.{});
+                if (options.ignore.len == 0) {
+                    try writeValue(gpa, out, obj.get(name).?, "", options);
+                    continue;
+                }
                 const child = if (prefix.len == 0)
                     try gpa.dupe(u8, name)
                 else

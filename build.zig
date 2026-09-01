@@ -47,6 +47,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const upstream_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/upstream.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "tapedeck", .module = mod }},
+        }),
+    });
+
     const failure_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/failure.zig"),
@@ -64,4 +73,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(e2e_tests).step);
     test_step.dependOn(&b.addRunArtifact(failure_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxy_tests).step);
+    test_step.dependOn(&b.addRunArtifact(upstream_tests).step);
 }
