@@ -18,7 +18,7 @@ jobs:
       contents: read
     steps:
       - name: checkout v5.0.0
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: setup zig v2.2.1
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
       - name: test
@@ -36,7 +36,7 @@ jobs:
         target: [x86_64-linux-musl, aarch64-linux-musl, x86_64-macos, aarch64-macos]
     steps:
       - name: checkout v5.0.0
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: setup zig v2.2.1
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
       - name: version matches the tag
@@ -53,7 +53,7 @@ jobs:
           tar -C out/bin -czf tapedeck-${{ matrix.target }}.tar.gz tapedeck
           sha256sum tapedeck-${{ matrix.target }}.tar.gz > tapedeck-${{ matrix.target }}.tar.gz.sha256
       - name: upload artifact v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: tapedeck-${{ matrix.target }}
           path: tapedeck-${{ matrix.target }}.tar.gz*
@@ -66,7 +66,7 @@ jobs:
       contents: write
     steps:
       - name: download artifacts v4
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           merge-multiple: true
           path: dist

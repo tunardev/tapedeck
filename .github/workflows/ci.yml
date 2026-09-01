@@ -27,7 +27,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: checkout v5.0.0
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: setup zig v2.2.1
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
       - name: test
@@ -51,7 +51,7 @@ jobs:
         target: [x86_64-linux-musl, aarch64-linux-musl, x86_64-macos, aarch64-macos]
     steps:
       - name: checkout v5.0.0
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: setup zig v2.2.1
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
       - name: build ${{ matrix.target }}
